@@ -1,0 +1,20 @@
+#!/bin/sh
+# Bootstrap the upload daemon into the console user's GUI session so it starts
+# running the moment the installer finishes — before the next login. The plist
+# in /Library/LaunchAgents handles every subsequent login on its own.
+set -e
+
+PLIST=/Library/LaunchAgents/ke.sli.slike.uploaderd.plist
+
+# The installer runs as root; the daemon must run as the logged-in user.
+consoleUser=$(stat -f%Su /dev/console)
+if [ -z "$consoleUser" ] || [ "$consoleUser" = "root" ]; then
+  exit 0 # No GUI user (e.g. installed at the login window); login will load it.
+fi
+uid=$(id -u "$consoleUser")
+
+# Reload cleanly whether or not a previous version was already running.
+launchctl bootout "gui/$uid" "$PLIST" 2>/dev/null || true
+launchctl bootstrap "gui/$uid" "$PLIST"
+
+exit 0

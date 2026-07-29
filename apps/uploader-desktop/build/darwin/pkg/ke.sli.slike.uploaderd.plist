@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Per-user upload daemon. Installed to /Library/LaunchAgents so it loads in
+  every user's GUI session: it starts at login (RunAtLoad) and is restarted if
+  it ever exits (KeepAlive), independent of the desktop app. The daemon derives
+  its socket, token, and database from the user's own config dir at runtime, so
+  one plist serves all users without per-user paths.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ke.sli.slike.uploaderd</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Applications/uploader-desktop.app/Contents/Resources/uploaderd</string>
+    </array>
+    <!--
+      The daemon reads its upload-server target from the environment (same as the
+      app-spawned daemon), so point production installs at the real server here:
+        <key>EnvironmentVariables</key>
+        <dict>
+          <key>SLIKE_SERVER</key><string>https://uploads.example.com:443</string>
+        </dict>
+      Without it the daemon uses its built-in default (https://localhost:443).
+    -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/vegad.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vegad.log</string>
+  </dict>
+</plist>

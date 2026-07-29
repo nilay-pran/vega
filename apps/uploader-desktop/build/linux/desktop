@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Slike Uploader
+Comment=Desktop uploader for the Slike Video CMS
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/uploader-desktop %u
+Terminal=false
+Type=Application
+Icon=uploader-desktop
+Categories=Utility;
+StartupWMClass=uploader-desktop
+
+ 

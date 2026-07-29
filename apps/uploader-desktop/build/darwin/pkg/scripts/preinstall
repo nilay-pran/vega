@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stop any running daemon before its binary is overwritten, so an upgrade
+# replaces a quiesced process rather than a live one.
+set -e
+
+PLIST=/Library/LaunchAgents/ke.sli.slike.uploaderd.plist
+
+consoleUser=$(stat -f%Su /dev/console)
+if [ -n "$consoleUser" ] && [ "$consoleUser" != "root" ]; then
+  uid=$(id -u "$consoleUser")
+  launchctl bootout "gui/$uid" "$PLIST" 2>/dev/null || true
+fi
+
+exit 0
