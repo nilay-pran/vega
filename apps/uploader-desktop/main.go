@@ -15,6 +15,7 @@ import (
 	"code.sli.ke/go/vega/packages/ipc"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 )
 
 //go:embed all:frontend/dist
@@ -55,8 +56,14 @@ func main() {
 
 	win := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:  "Slike Uploader",
-		Width:  1000,
-		Height: 680,
+		Width:  1180,
+		Height: 780,
+		// The CMS layout (sidebar + content) stops making sense below this.
+		MinWidth:  980,
+		MinHeight: 620,
+		// Lets the ingest drop zone accept files dragged from Finder; the
+		// frontend marks it with data-file-drop-target.
+		EnableFileDrop: true,
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 50,
 			Backdrop:                application.MacBackdropTranslucent,
@@ -68,6 +75,17 @@ func main() {
 		},
 		BackgroundColour: application.NewRGB(15, 17, 26),
 		URL:              "/",
+	})
+
+	// Files dropped on the ingest zone are enqueued exactly like picked ones.
+	// The drop arrives on the Go side (the webview never sees the paths), so the
+	// handler goes straight to the service.
+	win.OnWindowEvent(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
+		for _, path := range e.Context().DroppedFiles() {
+			if _, err := svc.Enqueue(context.Background(), path); err != nil {
+				log.Printf("enqueue dropped file %q: %v", path, err)
+			}
+		}
 	})
 
 	// Close hides the window instead of quitting; the tray keeps the app around.

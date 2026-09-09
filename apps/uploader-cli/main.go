@@ -12,13 +12,10 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
-	"time"
 
 	"code.sli.ke/go/vega/packages/common"
 	"code.sli.ke/go/vega/packages/database"
@@ -28,7 +25,6 @@ import (
 	"code.sli.ke/go/vega/packages/storage"
 	"code.sli.ke/go/vega/packages/telemetry"
 	"code.sli.ke/go/vega/packages/transport"
-	"code.sli.ke/go/vega/packages/transport/slkt"
 	"code.sli.ke/go/vega/packages/uploader"
 )
 
@@ -122,44 +118,15 @@ func run(o options, args []string) error {
 	return nil
 }
 
+// chooseTransport resolves -transport into a store. "auto" runs the full
+// waterfall — periodic reachability probing plus realtime circuit-breaker
+// failover across h3/http/slkt — for the duration of ctx; see
+// transport.BuildAuto. In -serve mode ctx lives for the whole process, same as
+// the daemon; for a single-file upload it lives only for this run.
 func chooseTransport(ctx context.Context, o options, log *slog.Logger) (storage.ObjectStore, error) {
-	slktAddr, err := transport.SLKTAddr(o.server)
-	if err != nil {
-		return nil, err
-	}
-	slktClient := slkt.NewClient(slktAddr)
-
-	hc := &http.Client{}
-	if o.insecure {
-		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
-	httpStore := transport.NewHTTPStore(o.server, o.token, hc)
-	h3Store := transport.NewHTTP3Store(o.server, o.token, o.insecure)
-
-	switch o.mode {
-	case "slkt":
-		return slktClient, nil
-	case "h3":
-		return h3Store, nil
-	case "http":
-		return httpStore, nil
-	case "presigned":
-		// Control plane over HTTPS; part bytes go client→Spaces directly. Requires
-		// the server to run an S3/Spaces backend (it registers the presign route).
-		return transport.NewPresignedStore(o.server, o.token, hc, o.insecure), nil
-	case "auto":
-		// QUIC/HTTP-3 primary, HTTPS-over-TCP failover; SLKT last while evaluated.
-		chosen, err := transport.Select(ctx, 2*time.Second,
-			transport.Candidate{Name: "h3", Store: h3Store, Probe: h3Store.Probe},
-			transport.Candidate{Name: "http", Store: httpStore, Probe: httpStore.Probe},
-			transport.Candidate{Name: "slkt", Store: slktClient, Probe: slktClient.Probe},
-		)
-		if err != nil {
-			return nil, err
-		}
-		log.Info("transport selected", "name", chosen.Name)
-		return chosen.Store, nil
-	default:
-		return nil, fmt.Errorf("unknown transport %q (want auto, h3, slkt, http, or presigned)", o.mode)
-	}
+	return transport.Choose(ctx, o.mode, transport.AutoConfig{
+		Server:   o.server,
+		Token:    o.token,
+		Insecure: o.insecure,
+	}, log)
 }

@@ -1,909 +1,329 @@
-# Slike Uploader — Platform Architecture
+# Slike Uploader — Architecture
 
-**Status:** Draft for review · **Version:** 0.1 · **Date:** 2026-07-21
-**Audience:** Engineering, Security/Compliance, Product
-**Decision gate:** Implementation begins only after this document is reviewed and approved.
+> Last verified: 2026-09-08 against commit `6f3e3e7` (branch `dev`, working tree with in-progress uncommitted changes to `apps/uploader-desktop`)
 
----
-
-## 0. Executive summary & the one decision that shapes everything
-
-We are building a commercial-grade desktop upload platform that replaces browser uploads for the existing Slike Video CMS. It behaves like Dropbox / Aspera Connect: a **background upload engine** is the product, and the **UI is only a controller**. The engine must transfer files from a few MB to several TB over unreliable, high-latency, high bandwidth-delay-product (BDP) WAN links, survive crashes and reboots, and never restart an upload from zero unless the user explicitly deletes it.
-
-**Approved data-path decision (hybrid, protocol-primary):**
-
-- **Primary path:** a **custom binary transport protocol (SLKT)**, server-in-path, over TLS 1.3/TCP for v1, architected to migrate to QUIC without touching the upload engine.
-- **Failover path:** **direct-to-object-storage** (S3 multipart to DigitalOcean Spaces over HTTPS/443), used automatically when the custom transport is blocked or degraded — the common case being **enterprise firewalls / deep-packet inspection** that block non-standard ports or protocols.
-
-The two paths are unified by a single insight that makes the whole system tractable:
-
-> **Every upload is exactly one S3-style multipart upload. A protocol "chunk" *is* a multipart "part". Parts may be contributed either by the server (custom path) or by the client (direct path). Assembly — `CompleteMultipartUpload` — is identical regardless of how each part arrived.**
-
-This means the assembler, the manifest, the resume logic, and the integrity model are **transport-agnostic**. We can build the simpler failover path first, then layer the custom protocol on top as a throughput optimization for the primary path, reusing all of the state, resume, and verification machinery.
-
-**SOC2 is a first-class, cross-cutting requirement** (Security, Availability, Processing Integrity, Confidentiality). It is not a section bolted on at the end; it is threaded through the security model, the audit/event design, key management, and the observability plan, and mapped explicitly to the Trust Services Criteria in §14.
-
-### 0.1 Guiding engineering principles (non-negotiable)
-
-The architecture below is deliberately capable, but the **code that implements it must be minimal, flat, and idiomatic Go**. Sophistication belongs in the *design*, not in the *source*. These principles override any temptation toward cleverness and apply to every package, in every phase:
-
-- **Simple and elegant — the way Go is known for.** Prefer small, obvious functions over abstractions that need a diagram to follow. If a reader has to hold more than one file in their head to understand a function, it is too deep.
-- **Shallow, not clever.** Avoid deep call stacks, generic gymnastics, reflection, and speculative interfaces. Interfaces exist only where we genuinely swap implementations (transport, storage, repos, clock) — not "just in case." Accept concrete types; return concrete types; keep interfaces small and defined at the consumer.
-- **Minimal surface.** No dead code, no unused config knobs, no framework-for-a-framework. Every type, field, and dependency earns its place or is deleted. Fewer packages doing clear jobs beats many thin packages.
-- **Readable by a human on first pass.** Names say what they do; errors are wrapped with context; control flow is linear and early-returning. Comments explain *why*, never *what*. Match the surrounding code's idiom.
-- **Standard library first.** Reach for `net`, `crypto/tls`, `database/sql`, `log/slog`, `context`, `io` before pulling a dependency. A new dependency must justify itself against the maintainability and SOC2 supply-chain cost.
-- **Boring is a feature.** Straightforward, well-tested, predictable code that thousands of users can rely on beats a smaller line count achieved through indirection. Long-term maintainability is the explicit priority over short-term implementation speed.
-
-Concretely: the hexagonal boundaries (§4) exist to keep each package small and testable, **not** to add layers. If a layer does not make the code simpler to read or test, it does not belong.
+This document describes the system **as implemented**, not as originally planned. An earlier draft (v0.1, 2026-07-21) proposed a considerably larger design — gRPC-based desktop↔daemon IPC, a rich multi-frame-type SLKT protocol, a two-level fair-share scheduler, JWKS-based auth, Postgres-backed multi-instance server state. Most of that draft was not built as specified; this rewrite replaces it with what actually exists in code, and calls out the gaps explicitly in [Architecture Gaps and Unclear Areas](#architecture-gaps-and-unclear-areas).
 
 ---
 
-## Table of contents
+## At a Glance
 
-1. High-level system architecture
-2. Component interaction diagrams
-3. Desktop architecture
-4. Upload engine architecture
-5. Custom protocol specification (SLKT)
-6. Wire protocol layout
-7. Session lifecycle
-8. Upload state machine
-9. Scheduler design
-10. Worker pool design
-11. SQLite schema (desktop) + server store
-12. Server architecture
-13. Storage abstraction
-14. Security model (incl. SOC2 mapping)
-15. Failure recovery strategy
-16. Performance optimization strategy
-17. Testing strategy
-18. Incremental implementation roadmap
-
-Appendices: A) Deliberate deviations from the brief, B) Open questions for review, C) Glossary.
+- **What it is:** a desktop-driven large-file upload platform for the Slike Video CMS, built to replace browser uploads. A local engine (daemon) chunks a file, uploads it as an S3-style multipart upload over one of several interchangeable transports, and verifies the result end-to-end by SHA-256.
+- **Language/stack:** Go (module `code.sli.ke/go/vega`, Go 1.25) for every backend component; the desktop shell is Wails v3 (Go + React/TypeScript, its own nested Go module).
+- **Major components:** `apps/uploaderd` (background engine daemon), `apps/uploader-desktop` (Wails desktop UI, thin controller), `apps/upload-server` + `apps/upload-server/cmd/upload-server-h3` (server-side multipart terminators), `apps/uploader-cli` (older single-process CLI harness), and a set of shared `packages/*` libraries.
+- **Where to start reading:** `packages/uploader/engine.go` (the orchestrator), `packages/transport/auto.go` (transport selection), `packages/storage/storage.go` (the core `ObjectStore` port), `packages/database/migrations/0001_init.sql` (schema), `apps/uploaderd/main.go` and `apps/uploader-desktop/main.go` (the two real processes).
+- **Notable fact for anyone extending this:** the "chunk = S3 multipart part" design from the original draft is real and enforced everywhere (`packages/manifests/plan.go`).
 
 ---
 
-## 1. High-level system architecture
+## System Overview
 
-Five macro-components:
+The product replaces slow, memory-bounded browser uploads with a native engine that streams files directly from disk, chunks them to match S3/Spaces multipart limits, and uploads chunks over whichever transport currently works — a custom UDP+TCP protocol (SLKT), HTTP/3 (QUIC), plain HTTP, or a presigned direct-to-storage path — with automatic failover between them (`packages/transport/breaker.go`, `failoverstore.go`).
 
-1. **Uploader Desktop (`apps/uploader-desktop`)** — Wails v3 + React/TS/Tailwind shell. Reuses existing CMS React components. It is a *thin controller*: login, queue, history, stats, settings, diagnostics, logs. It talks to the local engine over a local RPC channel; it holds no upload state of its own.
-2. **Upload Engine Daemon (`uploaderd`)** — a **separate long-lived OS process** owning the SQLite database, the transport(s), the scheduler, and the worker pools. Survives UI close/crash/logout. Auto-starts via the OS service manager. **This is the product.**
-3. **Upload Server (`apps/upload-server`)** — stateful data plane that terminates SLKT sessions, plus a control plane that mints direct-upload credentials, tracks multipart state in a shared relational store, assembles files, verifies checksums, notifies the CMS, and reaps stale uploads. Horizontally scalable.
-4. **Object Storage** — DigitalOcean Spaces (S3-compatible) as the durable chunk/part store and final-asset store. Abstracted behind an `ObjectStore` port so other stores can be added.
-5. **Existing Video CMS** — unchanged. Provides the Login/JWT API and receives "asset ready" notifications. We integrate; we do not modify its auth APIs.
+Two OS processes are central *(Verified — see [Startup and Initialization](#startup-and-initialization))*:
 
-```mermaid
-flowchart TB
-  subgraph Client["User machine"]
-    UI["Uploader Desktop<br/>(Wails v3 + React)<br/>controller only"]
-    D["uploaderd<br/>Upload Engine Daemon<br/>(SQLite, scheduler, workers)"]
-    KC["OS Keychain / DPAPI /<br/>Secret Service"]
-    FS["Local files"]
-    UI <-->|local RPC<br/>UDS/named pipe + token| D
-    D --> KC
-    D --> FS
-  end
+1. **`uploaderd`** — a long-lived daemon that owns all upload state (SQLite), runs the engine, and exposes it over a local Unix-domain-socket API.
+2. **`uploader-desktop`** — a Wails v3 GUI that holds no upload state itself; it is a client of `uploaderd` over that socket, and will spawn the daemon if it isn't already running.
 
-  subgraph Edge["Slike upload plane (horizontally scaled)"]
-    LB["Session-aware LB"]
-    US1["upload-server #1"]
-    US2["upload-server #N"]
-    PG[("Shared server store<br/>Postgres / DO Managed DB")]
-    LB --> US1 & US2
-    US1 & US2 --> PG
-  end
+A separate server side (`apps/upload-server`, `apps/upload-server/cmd/upload-server-h3`) terminates the various transports, drives S3-style multipart uploads against object storage, and notifies the CMS when a file is fully assembled and verified.
 
-  OS[("DigitalOcean Spaces<br/>(S3-compatible)")]
-  CMS["Existing Video CMS<br/>(Login/JWT + asset webhook)"]
-
-  D -->|"PRIMARY: SLKT custom protocol<br/>TLS/TCP → QUIC (server-in-path)"| LB
-  D -.->|"FAILOVER: S3 multipart<br/>HTTPS/443 (direct)"| OS
-  US1 & US2 -->|"server writes parts<br/>+ assemble + verify"| OS
-  D <-->|Login / refresh JWT<br/>reuse CMS APIs| CMS
-  US1 & US2 -->|asset-ready notify| CMS
-```
-
-**Design principles applied throughout:** Hexagonal (ports & adapters), repository pattern, dependency injection at the composition root, `context.Context` cancellation everywhere, an internal event bus, worker pools, streaming pipelines, explicit state machines, and interface-driven boundaries so every subsystem is independently testable.
+`apps/uploader-cli` is an older, still-present single-process harness that runs the same engine packages directly, in-process, with no daemon/IPC involved — it predates the daemon/desktop split and duplicates responsibility that `uploaderd` now owns *(Observed)*.
 
 ---
 
-## 2. Component interaction diagrams
+## Project Structure
 
-### 2.1 Control-plane: starting an upload (happy path, primary transport)
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant UI as Desktop UI
-  participant D as uploaderd
-  participant DB as SQLite
-  participant S as upload-server
-  participant OS as Spaces
-
-  UI->>D: EnqueueUpload(path, priority, cmsFileId)
-  D->>DB: INSERT upload(Queued) + manifest(placeholder)
-  D->>D: Prepare: stream-hash SHA256, size, choose chunk size
-  D->>DB: UPDATE manifest(chunkSize,count,sha256) state=Ready
-  D->>S: SLKT SESSION_OPEN(jwt, manifest)
-  S->>S: verify JWT + ownership; InitMultipart(Spaces)
-  S->>OS: CreateMultipartUpload -> multipartId
-  S->>DB: (server store) persist upload+multipartId
-  S-->>D: SESSION_READY(sessionId, missingParts=[all])
-  loop transfer
-    D->>S: CHUNK_DATA(streamId, partIdx, bytes, crc32c, sha256)
-    S->>OS: UploadPart(multipartId, partIdx) -> ETag
-    S-->>D: CHUNK_ACK(partIdx, ETag) + FLOW_UPDATE(credits)
-    D->>DB: mark chunk Acked, persist ETag, checkpoint
-  end
-  D->>S: SESSION_COMPLETE(finalSha256)
-  S->>OS: CompleteMultipartUpload(parts[])
-  S->>OS: HEAD final; verify size + checksum
-  S->>CMS: notify asset-ready(fileId, key, sha256)
-  S-->>D: COMPLETED
-  D->>DB: upload state=Completed
+```
+apps/
+  uploaderd/                 background engine daemon (real process #1)
+  uploader-desktop/          Wails v3 GUI, thin controller (real process #2, separate Go module)
+  upload-server/             HTTP(S) + SLKT multipart server (cmd/upload-server)
+  upload-server/cmd/upload-server-h3/  HTTP/2 + HTTP/3(QUIC) variant of the same server, for comparison
+  uploader-cli/              older single-process CLI that runs the engine directly, no IPC
+packages/
+  common/        domain vocabulary (UploadStatus, ChunkState), typed IDs, EventBus, sentinel errors
+  logger/        slog JSON logger wrapper
+  telemetry/     bandwidth/ETA EWMA sampler + in-memory metrics counters
+  database/      SQLite Open (WAL) + versioned migration runner + embedded migrations/
+  manifests/     chunk-size planning + SQLite-backed upload/chunk persistence (the source of truth)
+  resumable/     one function: reset InFlight chunks to Pending on startup
+  scheduler/     bounded-concurrency task runner (errgroup wrapper) — not a fairness scheduler
+  uploader/      the engine: Engine, Manager, Supervisor, Notifier (orchestration + state transitions)
+  storage/       ObjectStore port + MemStore (fake) + S3Store (minio-go, real backend)
+  protocol/      SLKT binary frame codec (header, types, CRC32C)
+  transport/     ObjectStore-compatible adapters: HTTP, HTTP/3, presigned-direct, SLKT, failover chooser
+  auth/          Verifier port + DevVerifier (static token) + JWTVerifier (hand-rolled HS256)
+  ipc/           HTTP+JSON+SSE API served over a Unix domain socket, shared by desktop UI and (indirectly) CLI
+  bench/         test-only UDP-relay + comparative benchmark of SLKT vs HTTP/3, not shipped
 ```
 
-### 2.2 Failover negotiation (custom transport blocked by firewall)
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant D as uploaderd
-  participant S as upload-server (control)
-  participant OS as Spaces
-
-  D->>D: Reachability probe (Happy-Eyeballs style)
-  par SLKT on custom port
-    D->>S: TCP connect :7443
-  and SLKT on 443
-    D->>S: TCP connect :443 (ALPN "slkt")
-  and Control API on 443
-    D->>S: HTTPS GET /v1/ping
-  end
-  Note over D: custom-port + ALPN both time out (DPI),<br/>only HTTPS control API answers
-  D->>S: HTTPS POST /v1/uploads (jwt, manifest)
-  S->>OS: CreateMultipartUpload -> multipartId
-  S-->>D: presign batch (UploadPart URLs, TTL, per-part sha256 required)
-  loop transfer (direct)
-    D->>OS: PUT part (presigned) -> ETag
-    D->>S: HTTPS POST /v1/uploads/{id}/parts (idx, ETag, sha256)
-  end
-  D->>S: HTTPS POST /v1/uploads/{id}/complete(finalSha256)
-  S->>OS: CompleteMultipartUpload + verify
-  S->>CMS: notify asset-ready
-```
-
-Both diagrams converge on the same server-side `Complete + verify + notify`. The only difference is *who* calls `UploadPart` and over *what* transport.
-
-### 2.3 UI ↔ Engine (controller pattern)
-
-```mermaid
-flowchart LR
-  subgraph UI["Desktop UI (React)"]
-    V["Views: Queue, History,<br/>Stats, Diagnostics, Logs"]
-  end
-  subgraph D["uploaderd"]
-    API["Local Control API<br/>(gRPC over UDS / named pipe)"]
-    EB["Event Bus"]
-    ENG["Upload Engine"]
-  end
-  V -->|commands: enqueue, pause,<br/>resume, cancel, reprioritize| API
-  API --> ENG
-  ENG --> EB
-  EB -->|streamed events: progress,<br/>speed, state changes, logs| API
-  API -->|server-push stream| V
-```
-
-The UI subscribes to an event stream; it renders state, it does not own it. If the UI dies, the engine keeps transferring; on relaunch the UI reconnects and re-reads current state from the engine (which reads from SQLite).
+`apps/uploader-desktop` is a **nested Go module** (`apps/uploader-desktop/go.mod`, module `code.sli.ke/go/vega/apps/uploader-desktop`) with its own `frontend/` React/TypeScript/Tailwind app and Wails-generated TypeScript bindings under `frontend/bindings/code.sli.ke/go/vega/...`.
 
 ---
 
-## 3. Desktop architecture
+## Startup and Initialization
 
-### 3.1 Two-process model (why the engine is a separate daemon)
+**`apps/uploaderd/main.go`** (the daemon):
+1. Opens the SQLite DB and runs migrations (`database.Open`, `database.Migrate`).
+2. Runs `resumable.Recover` — resets any chunk left `InFlight` from a previous crash back to `Pending`.
+3. Starts a `uploader.Supervisor` (long-lived queue driver).
+4. Picks a transport via `transport.Choose`/`chooseTransport` (`-transport` flag: `auto|h3|slkt|http|presigned`).
+5. Builds an `ipc.Server` and calls `Serve(ctx, socketPath)`, which opens a Unix domain socket (`net.Listen("unix", ...)`, `packages/ipc/server.go`), `chmod 0600`.
+6. Handles `SIGINT`/`SIGTERM` for graceful shutdown.
 
-The single hardest requirement is: *the upload engine must keep running when the window closes, the app is minimized, the UI crashes, or the user logs out and back in.* A GUI framework's process lifecycle is tied to its window/event loop, so we **decouple the engine into its own OS process**, `uploaderd`, and make the Wails app a client of it.
+**`apps/uploader-desktop/main.go`** (the GUI):
+1. `ensureDaemon(socket)` (`daemon.go`) dials the daemon's Unix socket; if nothing answers, spawns `uploaderd` as a **detached** child process (`Setsid` on Unix, `DETACHED_PROCESS`/`CREATE_NEW_PROCESS_GROUP` on Windows) so it outlives the GUI.
+2. Constructs a Wails `application.New(...)` with exactly one bound service, `UploadService` (`service.go`), which wraps an `ipc.Client` — it holds no upload state of its own.
+3. Opens one window, wires drag-and-drop to `UploadService.Enqueue`, sets up a system tray (`tray.go`), and starts a goroutine that subscribes to the daemon's SSE event stream and re-emits events into the Wails frontend.
+4. On macOS, a LaunchAgent plist (referenced in `apps/uploader-desktop/architecture.md`) can keep the daemon running independent of login session — *(Observed; plist ships with `SLIKE_SERVER` commented out, defaulting to `localhost:443` per that same doc)*.
 
-```mermaid
-flowchart TB
-  subgraph proc1["Process: uploaderd (headless, auto-start)"]
-    ENG["Upload Engine + Scheduler + Workers"]
-    DBX[("SQLite (WAL)")]
-    TR["Transports: SLKT + S3-direct"]
-    TRAY["System-tray agent (optional co-process)"]
-  end
-  subgraph proc2["Process: Uploader Desktop (Wails v3)"]
-    RC["Local RPC client"]
-    WV["WebView: React CMS + upload views"]
-  end
-  proc2 <-->|"gRPC over UDS (macOS/Linux)<br/>/ named pipe (Windows)<br/>+ per-user auth token"| proc1
-  ENG --> DBX
-  ENG --> TR
-```
+**`apps/upload-server/cmd/upload-server/main.go`** (server, SLKT variant):
+1. Selects a storage backend via `-backend mem|s3` (`storage.NewMemStore` or `storage.NewS3Store`).
+2. Builds an `auth.Verifier` (`-jwt-secret` → `auth.JWTVerifier`, else `auth.DevVerifier`).
+3. Builds/loads a TLS config (`buildTLS`, real cert via `-tls-cert/-tls-key`, else a self-signed dev cert from `devcert.go`).
+4. Opens **one TCP listener and one UDP listener on the same `-addr`** (default `:443`). The TCP listener is demultiplexed by peeking the first byte of each connection (`mux.go`): `0x16` (TLS ClientHello) routes to the HTTPS API listener, anything else routes to the SLKT control listener.
+5. Runs `slkt.NewServer(objects, log).Serve(...)` over the SLKT TCP + UDP, and an `http.Server` over the TLS-wrapped HTTPS listener serving `uploadserver.New(...).Handler()`.
 
-- **Local RPC:** gRPC over a **Unix domain socket** (macOS/Linux) or **named pipe** (Windows), never a TCP port, to avoid exposing the engine to other machines. A per-user token (created at first run, stored in the keychain, `chmod 600`) authenticates the UI to the daemon so a hostile local process cannot drive uploads.
-- **Auto-start & supervision:** `launchd` LaunchAgent (macOS), `systemd --user` unit (Linux), Windows Service or Scheduled Task (Windows). The service manager restarts the daemon on crash and at login/boot.
-- **Single-instance:** lockfile + advisory lock on the socket; a second launch attaches to the existing daemon.
-- **System tray:** minimize-to-tray with pause/resume/quit and aggregate progress. The tray lives with (or alongside) the daemon so closing the main window does not stop transfers.
+**`apps/upload-server/cmd/upload-server-h3/main.go`** — a separate binary sharing the same `uploadserver.New(...).Handler()` route set, but serving it over plain TCP (HTTP/1.1+2, for failover) and UDP (HTTP/3 via `quic-go/http3`) on `:443`, with no SLKT and no demux. Its own doc comment says it exists "kept beside the SLKT-multiplexing upload-server for comparison."
 
-### 3.2 Reusing the existing CMS UI
-
-- The Wails WebView loads the existing React/PWA CMS surface. We reuse the CMS's components and styling (the shared player SDK CSS core tokens are available as a design source). The additional working directory `slike-player/.../css/core` is treated as a design-token dependency, not vendored code.
-- The **Upload button** is rewired: instead of calling browser upload APIs (`fetch`/XHR/`<input type=file>` streaming), it invokes a **native bridge** exposed by Wails that forwards to the daemon's `EnqueueUpload`. A native file picker (Wails dialog) selects paths; the daemon reads bytes directly from disk (no browser memory buffering, which is what caps browser uploads at large sizes).
-- Everything else in the CMS continues to run as a normal web app inside the WebView, hitting existing CMS APIs with the stored JWT.
-
-### 3.3 Required screens (all controller views over engine state)
-
-| Screen | Source of truth | Notes |
-|---|---|---|
-| Login | CMS Login API | JWT stored in keychain; auto-refresh by daemon |
-| Upload Queue | engine `queue` + `uploads` | reorder/priority, pause/resume/cancel |
-| Search | CMS APIs | reuse existing CMS search |
-| Upload History | engine `uploads` (terminal states) | filter, re-verify, open in CMS |
-| Transfer Statistics | engine `transfer_statistics` | live + historical graphs |
-| Settings | engine `settings` | bandwidth cap, concurrency, paths, transport prefs |
-| Diagnostics | engine + transport probes | reachability, path in use, MTU/RTT, NAT |
-| Logs | engine `logs` (structured) | tail + export bundle |
+**`apps/uploader-cli/main.go`** — no daemon/socket involved; wires `database.Open`, `manifests.NewStore`, and `uploader.New` directly, then either runs one file (default), enqueues without running (`-enqueue-only`), or drains the whole queue continuously (`-serve`, via `resumable.Recover` + `uploader.NewManager(...).RunQueue`).
 
 ---
 
-## 4. Upload engine architecture
+## Components and Responsibilities
 
-Hexagonal core. The domain (engine, scheduler, state machines, manifests) depends only on **ports** (interfaces); concrete **adapters** are injected at the composition root.
+### `packages/uploader` — the engine (`Engine`, `Manager`, `Supervisor`, `Notifier`)
 
-```mermaid
-flowchart TB
-  subgraph core["Domain core (pure, no I/O)"]
-    ENG["Upload Engine<br/>(orchestrator + state machines)"]
-    SCH["Scheduler (2-level)"]
-    MAN["Manifest logic"]
-    INT["Integrity/verify"]
-  end
-  subgraph ports["Ports (interfaces)"]
-    P1["TransportPort"]
-    P2["ObjectStorePort"]
-    P3["ManifestRepo / ChunkRepo / UploadRepo"]
-    P4["FileSourcePort"]
-    P5["AuthPort"]
-    P6["EventBus"]
-    P7["Clock"]
-    P8["TelemetryPort"]
-    P9["SecretStorePort"]
-  end
-  subgraph adapters["Adapters (I/O)"]
-    A1["SLKT transport / S3-direct transport"]
-    A2["DO Spaces (S3 SDK)"]
-    A3["SQLite repositories"]
-    A4["OS filesystem (pread/mmap, sync.Pool)"]
-    A5["CMS JWT + JWKS"]
-    A6["in-proc event bus"]
-    A7["system / virtual clock"]
-    A8["OpenTelemetry + slog"]
-    A9["Keychain/DPAPI/SecretService"]
-  end
-  ENG --> P1 & P2 & P3 & P4 & P5 & P6 & P7 & P8 & P9
-  SCH --> P1 & P3 & P6 & P7
-  P1 --- A1
-  P2 --- A2
-  P3 --- A3
-  P4 --- A4
-  P5 --- A5
-  P6 --- A6
-  P7 --- A7
-  P8 --- A8
-  P9 --- A9
-```
+- **`Engine`** (`engine.go`) — owns the per-upload lifecycle:
+  - `Enqueue` — hashes the whole source file up front (`hashFile`), plans chunk size/count (`manifests.PlanChunkSize`/`PlanChunks`), persists via `manifests.Store.CreateUpload`, appends a hash-chained audit event, emits `upload.created`.
+  - `Run` — resumable: resets any `InFlight` chunks to `Pending`, initializes the multipart upload if needed, computes the missing-chunk set, and runs one `scheduler.Task` per missing chunk through `scheduler.Run` (a bounded-concurrency `errgroup`, not a separate worker-pool abstraction).
+  - `uploadChunk` — streams the chunk's byte range via `io.SectionReader` + `io.TeeReader` (computing SHA-256 on the fly), uploads the part, marks it acked, updates progress/telemetry, emits a `progress` event.
+  - `finish` — completes the multipart upload, then **re-reads the assembled object and verifies its whole-file SHA-256 before marking the upload `Completed`** — the one integrity invariant from the original design that is fully implemented and enforced.
+  - `Abort` — aborts the multipart upload and marks the upload `Canceled`.
+- **`Manager`** (`manager.go`) — a one-shot queue drainer: lists active uploads and runs each through `Engine.Run` via `scheduler.Run`, swallowing per-upload errors so one failure doesn't cancel the rest. Used by `apps/uploader-cli -serve`.
+- **`Supervisor`** (`supervisor.go`) — a long-lived queue driver used by `apps/uploaderd`: tracks running uploads by cancel-func, `Kick()` backfills free concurrency slots from the queue, and exposes `Pause`/`Resume`/`Cancel`/`Stop`. Each finished upload's goroutine calls `Kick()` again to pull the next one.
+  - *(Observed inconsistency)* `Manager` reads the queue via `manifests.Store.ListActive`, while `Supervisor` reads it via `manifests.Store.RunnableUploads` — the latter excludes `paused` uploads, the former does not. Two independent queue-read paths with different pause semantics currently coexist.
+- **`Notifier`** (`notifier.go`) — `LogNotifier` (writes to the log) and `HTTPNotifier` (HMAC-signed CMS webhook POST with an `Idempotency-Key` header) both implement `AssetReady(...)`.
 
-### 4.1 Package layout (`packages/`)
+State is represented as plain string constants (`common.UploadStatus`, `common.ChunkState`) set ad hoc by `SetStatus`/`Mark*` calls scattered through `engine.go`/`supervisor.go` — there is **no enum-driven transition table or session-lifecycle state machine** as such (see Gaps).
 
-| Package | Responsibility | Depends on |
-|---|---|---|
-| `common` | shared types, IDs, errors, result helpers, config | — |
-| `logger` | structured logging (slog), redaction, log sinks | common |
-| `telemetry` | metrics, tracing hooks, bandwidth sampler | common, logger |
-| `database` | SQLite driver, migrations, connection mgmt, WAL config | common |
-| `storage` | `ObjectStore` port + Spaces/MinIO adapters | common |
-| `manifests` | manifest model + persistence + missing-set math | common, database |
-| `resumable` | resume/checkpoint logic, crash-recovery reconstruction | manifests, database |
-| `protocol` | SLKT frame definitions, codec, version negotiation, capabilities | common |
-| `transport` | `Transport` port + SLKT(TCP/TLS) adapter + S3-direct adapter + path chooser | protocol, storage, telemetry |
-| `scheduler` | upload-level + chunk-level scheduling, fairness, adaptivity | manifests, telemetry |
-| `uploader` | the engine: orchestration, state machines, worker pools, event bus | all of the above |
-| `auth` | JWT validation/refresh, JWKS, keychain-backed secret store | common |
+### `packages/manifests` — persistence and chunk planning
 
-`apps/uploader-desktop` and `apps/upload-server` wire these packages together; **no business logic lives in `apps/`** and **no code is duplicated between them**.
+- `plan.go` — `PlanChunkSize`/`PlanChunks`: real adaptive chunk-size math, clamped to S3/Spaces multipart limits (`MinPartSize = 5 MiB`, `MaxPartSize = 5 GiB`, `MaxParts = 10000`).
+- `store.go` — a `Store` backed directly by `database/sql` against SQLite: `CreateUpload`, `LoadUpload`, `MissingChunks`/`AckedChunks`, `MarkInFlight`/`MarkAcked`/`MarkPending`/`ResetInFlight`, `DoneBytes`/`UpdateProgress`/`RecordStat`, `ListActive`/`RunnableUploads`, `ListSummaries`/`LoadSummary`, `SetSetting`/`GetSetting`, and `AppendEvent` (a genuine hash-chained audit log: `hash = SHA256(prev_hash ‖ payload)`, matching the original SOC2 design intent).
 
-### 4.2 Data flow inside the engine (per upload)
+### `packages/database` — schema and migration runner
 
-```
-FileSource(pread, pooled buf) ──▶ Chunker(adaptive size) ──▶ Scheduler(lease) ──▶ Worker
-      ──▶ Transport.SendChunk() ──▶ [ACK] ──▶ ChunkRepo.MarkAcked + checkpoint ──▶ Manifest.MissingSet--
-```
+- `db.go` — `Open(ctx, path)` via `modernc.org/sqlite` (pure Go, no cgo), WAL mode, `busy_timeout=5000`, `foreign_keys=1`, connection pool capped at 1 (single-writer).
+- `migrate.go` — forward-only runner using `//go:embed migrations/*.sql`, tracked in a `schema_migrations` table.
+- `migrations/0001_init.sql` — the **only** migration; creates `users`, `sessions`, `uploads`, `upload_manifests`, `chunks`, `workers`, `transfer_statistics`, `settings`, `queue`, `logs`, `events`, matching the original design's schema closely (see [Data and Storage](#data-and-storage)).
 
-Backpressure propagates upstream via transport credits → scheduler withholds leases → workers idle → file reads pause. Memory is therefore bounded by `workers × bufferSize`, independent of file size (see §16).
+### `packages/scheduler` — bounded concurrency, not fairness
 
----
+`pool.go` (28 lines) is the entire package — its own doc comment calls it "deliberately tiny for v1: a fixed-limit worker pool." It wraps `golang.org/x/sync/errgroup` with `SetLimit`. There is no priority queue, no weighted-fair-queuing/aging, no bandwidth governor, no BDP-driven adaptive parallelism, and no two-level (upload-level + chunk-level) distinction. The `queue` table's `eligible_at` backoff column is written once at insert (always 0) and never read again *(Gap)*.
 
-## 5. Custom protocol specification (SLKT)
+### `packages/resumable` — crash recovery
 
-**Name:** SLKT ("Slike Transport"). **Model:** a *persistent, multiplexed, session-oriented streaming protocol* — not request/response. A session outlives individual TCP connections and individual app runs (it can be resumed by ID).
+One function, `Recover(ctx, store)`: lists active uploads, resets any `InFlight` chunk to `Pending`, sets the upload back to `Ready`. Called at startup by both `apps/uploaderd` and `apps/uploader-cli`. `Engine.Run` also does the same reset per-upload inline (`engine.go`), so the logic exists in two places.
 
-### 5.1 Transport design: hybrid UDP + TCP (FASP/UDT-style), QUIC-ready
-
-SLKT uses a **hybrid UDP + TCP** transport, the same shape as Aspera FASP and UDT — chosen because a single TCP flow collapses on high bandwidth-delay, lossy WAN links, exactly the conditions this product targets:
-
-- **Bulk DATA over UDP.** Data packets are not subject to TCP's per-flow congestion control, so throughput is governed by our own pacing/loss-recovery rather than by TCP backing off on every loss event.
-- **CONTROL + reliability feedback over TCP.** Session/part setup, completion, and — crucially — **aggregated selective NAKs** (the byte ranges still missing) travel on a reliable TCP channel. Gap-based NAKs, not per-packet ACKs: per-packet ACKs over TCP would add latency and re-introduce the very bottleneck we are avoiding. The client retransmits only the NAK'd gaps over UDP and loops until the server acknowledges the whole part.
-- **Integrity.** Each datagram carries the SLKT frame header CRC (§6); the server verifies a CRC32C over the fully reassembled part before it touches storage; the engine verifies the whole-file SHA256 after assembly. Three layers, cheapest first.
-
-**Implemented** in `packages/transport/slkt` (client + server) with NAK-driven retransmit, a shared token-bucket **pacer** (fixed-rate v1), and enlarged socket buffers. It satisfies `storage.ObjectStore`, so the engine, scheduler, manifests, and server assembly are **untouched** — SLKT is just another object-store adapter beside `HTTPStore` and direct-to-Spaces.
-
-**QUIC migration.** QUIC is itself reliable-streams-over-UDP with built-in loss recovery, BBR-like congestion control, 0-RTT resume and connection migration. Moving to it means **deleting** our manual UDP-retransmit + TCP-NAK + pacer and mapping each part onto a QUIC stream; the frame *semantics* and the `ObjectStore` boundary are unchanged. Because the engine only sees the port, this touches `packages/transport` only.
-
-> Follow-ons (P4): the fixed-rate pacer becomes RTT-driven BBR-style congestion control (§5.4, §16); per-part in-memory reassembly becomes disk-backed for multi-GB parts; the reliable channel gains TLS.
-
-### 5.2 Capabilities (negotiated, not assumed)
-
-`TLS 1.3` (mandatory), `JWT auth`, `multiplexed streams`, `segmented transfer`, `chunk ACKs`, `resumable sessions`, `manifests`, `integrity (CRC32C + SHA256)`, `adaptive flow control`, `congestion awareness`, `out-of-order chunk acceptance`, `parallel workers`, `server backpressure`, `optional compression`, `optional dedup`, `version negotiation`. Each is advertised in the HELLO/CAPABILITY exchange; either side may decline an optional capability.
-
-### 5.3 Streams
-
-- **Stream 0 — Control:** HELLO, AUTH, SESSION_OPEN/RESUME/READY, MANIFEST, FLOW_UPDATE, PING/PONG, BACKPRESSURE, DEDUP_*, ERROR, GOODBYE, COMPLETE. Reliable, ordered.
-- **Streams ≥1 — Data:** carry CHUNK_DATA and inline CHUNK_ACK. Independent; a stall on one does not block others (native over QUIC; over TCP we spread data streams across the connection pool to approximate independence).
-
-### 5.4 Flow control & congestion awareness
-
-- **Credit-based flow control** (HTTP/2 / QUIC style): the receiver advertises per-stream and per-session **byte credits** via `FLOW_UPDATE`. Senders must not exceed available credit. The **server implements backpressure** by shrinking credits when its storage-write pipeline (UploadPart to Spaces) falls behind — this is explicit, first-class server-side backpressure, not TCP's implicit signal.
-- **Congestion control (app-level, BBR-inspired):** the sender continuously estimates **delivery rate** (ACKed bytes / interval, EWMA) and **min RTT** (via PING/PONG timestamps) to compute a **bandwidth-delay product** and set a **pacing rate** and an in-flight cap across the connection pool. This remains **fair** to competing traffic by targeting the estimated bottleneck bandwidth rather than blindly filling buffers, and by backing off on sustained RTT inflation (bufferbloat signal). Over QUIC, native CC replaces this.
-- **Adaptive chunk sizing:** chunk size is a function of measured throughput and RTT (larger on fat, stable links; smaller on lossy links to cut re-send cost), clamped by the multipart constraints in §13.
-
-### 5.5 Out-of-order & idempotency
-
-Data streams may deliver chunks out of order; the server keys each write by `(uploadId, partIndex)`, so ordering is irrelevant and **re-delivery of any chunk is a no-op** (idempotent). This is the backbone of both resume and exactly-once semantics.
-
----
-
-## 6. Wire protocol layout
-
-All integers big-endian (network order). Every SLKT message is a **frame**: a fixed 26-byte header followed by a type-specific payload. Confidentiality and on-the-wire integrity come from TLS 1.3; SLKT adds application-level integrity (CRC32C fast-path + SHA256 strong) and replay defense. (Implemented in `packages/protocol`; the authoritative byte layout is the offset table in `frame.go`.)
-
-### 6.1 Frame header (26 bytes, fixed)
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   MAGIC 'S' 'L' |  VER  | TYPE  |            FLAGS            |   MAGIC(16)=0x534C VER(8) TYPE(8) FLAGS(16)
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          STREAM ID (32)                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     FRAME SEQUENCE (64)                        |  monotonic per session; replay defense
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                      PAYLOAD LENGTH (32)                       |  bytes of payload following header
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     HEADER CRC32C (32)                         |  covers the 20 preceding header bytes
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        PAYLOAD (var)                           |
-```
-
-- **MAGIC** `0x534C` ("SL") — frame-sync + quick reject of garbage.
-- **VER** — protocol version; negotiated in HELLO, constant thereafter.
-- **TYPE** — frame type (table below).
-- **FLAGS** — bit field: `FIN`, `COMPRESSED`, `LAST_PART`, `RESUME`, `NEEDS_ACK`, `URGENT`, reserved.
-- **STREAM ID** — 0 = control; odd = client-initiated data; even = server-initiated (mirrors QUIC parity for painless migration).
-- **FRAME SEQUENCE** — per-session monotonic counter; the server rejects non-monotonic/duplicated sequences on the control stream (replay protection).
-- **PAYLOAD LENGTH** — bounded (default max 8 MiB payload) to cap parser memory.
-- **HEADER CRC32C** — catches header corruption before we trust the length field.
-
-### 6.2 Frame types
-
-| TYPE | Name | Stream | Payload summary |
-|---|---|---|---|
-| 0x01 | HELLO | 0 | supported versions, capabilities bitmap, client build |
-| 0x02 | HELLO_ACK | 0 | chosen version, granted capabilities |
-| 0x03 | AUTH | 0 | JWT (access), client nonce |
-| 0x04 | AUTH_ACK | 0 | server nonce, session TTLs |
-| 0x05 | SESSION_OPEN | 0 | manifest header (uploadId, fileId, size, sha256, chunkSize, count) |
-| 0x06 | SESSION_RESUME | 0 | sessionId/uploadId |
-| 0x07 | SESSION_READY | 0 | sessionId, multipartId ref, **missing-parts bitmap/RLE**, credits |
-| 0x10 | CHUNK_DATA | ≥1 | partIndex(32), offset(64), len(32), CRC32C(32), SHA256(256), bytes |
-| 0x11 | CHUNK_ACK | ≥1 | partIndex(32), ETag, status |
-| 0x12 | CHUNK_NAK | ≥1 | partIndex(32), reason (crc/sha mismatch, storage error) |
-| 0x20 | FLOW_UPDATE | 0/≥1 | stream credit delta, session credit delta |
-| 0x21 | BACKPRESSURE | 0 | pause/resume, suggested rate |
-| 0x22 | PING | 0 | echo token, send-timestamp |
-| 0x23 | PONG | 0 | echoed token + timestamps (for RTT) |
-| 0x30 | DEDUP_QUERY | 0 | chunk sha256 list |
-| 0x31 | DEDUP_HIT | 0 | indices already present server-side (skip upload) |
-| 0x40 | SESSION_COMPLETE | 0 | final sha256, total parts |
-| 0x41 | COMPLETED | 0 | final object key, verified sha256 |
-| 0x50 | ERROR | 0/≥1 | code, retryable flag, message |
-| 0x51 | GOODBYE | 0 | graceful close, reason |
-
-**Missing-parts encoding:** run-length-encoded ranges (not a raw bitmap) so a 5 TB file with 500 MB parts (~10k parts) resumes with a tiny `SESSION_READY`. This is what makes resume O(gaps), not O(file size).
-
-### 6.3 Versioning
-
-`VER` in every header + explicit HELLO negotiation. Unknown frame `TYPE` on a known version with the `reserved`/`must-understand` bit clear is *ignored* (forward-compat); with the bit set it is a protocol error. This lets us add frames without breaking old peers.
-
----
-
-## 7. Session lifecycle
-
-```mermaid
-stateDiagram-v2
-  [*] --> Probing
-  Probing --> ConnectingSLKT: custom transport reachable
-  Probing --> Degraded_Direct: custom blocked (firewall/DPI)
-  ConnectingSLKT --> Handshaking: TCP+TLS up
-  Handshaking --> Authenticating: HELLO/HELLO_ACK (version+caps)
-  Authenticating --> Establishing: AUTH_ACK (JWT ok)
-  Establishing --> Active: SESSION_READY (missing set)
-  Establishing --> Resuming: SESSION_RESUME accepted
-  Resuming --> Active
-  Active --> Draining: SESSION_COMPLETE sent
-  Draining --> Closed: COMPLETED
-  Active --> Reconnecting: connection lost / RTT timeout
-  Reconnecting --> Handshaking: backoff+jitter
-  Reconnecting --> Degraded_Direct: repeated SLKT failure
-  Degraded_Direct --> Active: switched to S3-direct path
-  Active --> Expired: idle/absolute TTL exceeded
-  Expired --> Authenticating: re-auth then resume
-  Closed --> [*]
-```
-
-- **Probing / path selection** uses a *Happy-Eyeballs*-style race: try SLKT on the custom port **and** on 443 (ALPN `slkt`) **and** the HTTPS control API concurrently; pick the first that completes the handshake within a deadline. Persist the winning path per network fingerprint (SSID/gateway) so subsequent uploads on the same network skip the probe.
-- **Reachability failover** is triggered by: connect timeout, TLS/ALPN rejection, DPI resets, or sustained loss making SLKT slower than a direct-path estimate. Failover **reuses the same manifest and multipart upload** — no restart.
-- **Session TTLs:** idle timeout (e.g. 5 min → PING keepalive) and absolute TTL (e.g. 24 h) after which re-auth + resume is required. Server persists enough state (multipartId, part ETags) to resume across TTL and across server instances.
-
----
-
-## 8. Upload state machine
-
-Two nested machines: **per-upload** and **per-chunk**. Both are persisted after every transition (nothing critical lives only in memory).
-
-### 8.1 Per-upload
-
-```mermaid
-stateDiagram-v2
-  [*] --> Queued
-  Queued --> Preparing: scheduled
-  Preparing --> Ready: hashed + manifest persisted
-  Ready --> Connecting
-  Connecting --> Uploading: session Active
-  Uploading --> Paused: user pause / bandwidth window
-  Paused --> Uploading: resume
-  Uploading --> Reconnecting: transport lost
-  Reconnecting --> Uploading: session resumed (SLKT or direct)
-  Uploading --> Verifying: all parts Acked
-  Verifying --> Assembling: final sha256 matches
-  Assembling --> Completed: CompleteMultipart + HEAD verify + CMS notify
-  Uploading --> Failed: terminal error (auth revoked, quota, corrupt source)
-  Verifying --> Failed: checksum mismatch (tamper/corruption)
-  Failed --> Ready: user retry
-  Queued --> Canceled: user delete
-  Uploading --> Canceled: user delete (abort multipart)
-  Completed --> [*]
-  Canceled --> [*]
-```
-
-Key invariant: **a transition to `Completed` requires a verified end-to-end SHA256 match after assembly.** Anything less is `Verifying`/`Failed`, never silently "done."
-
-### 8.2 Per-chunk (part)
-
-```mermaid
-stateDiagram-v2
-  [*] --> Pending
-  Pending --> InFlight: leased to worker
-  InFlight --> Acked: CHUNK_ACK (ETag stored)
-  InFlight --> Pending: NAK / timeout / conn loss (retry++)
-  Acked --> Verified: ETag/sha confirmed at complete
-  Pending --> Skipped: DEDUP_HIT (already stored)
-  Acked --> [*]
-  Skipped --> [*]
-```
-
-On daemon restart, any chunk found `InFlight` is reset to `Pending` (the transfer was interrupted) — deterministic recovery.
-
----
-
-## 9. Scheduler design
-
-Two levels, both adaptive.
-
-```mermaid
-flowchart TB
-  subgraph L1["Level 1 — Upload scheduler (across uploads)"]
-    PQ["Priority queue + aging<br/>(WFQ fair-share)"]
-    CAP["Concurrency caps:<br/>global + per-upload"]
-    BW["Global bandwidth governor<br/>(user cap + fairness)"]
-  end
-  subgraph L2["Level 2 — Chunk scheduler (within an upload)"]
-    MISS["Missing-set iterator"]
-    RETRY["Retry policy (backoff+jitter,<br/>failed-only re-send)"]
-    OOO["Out-of-order dispatch"]
-    ADAPT["Adaptive parallelism<br/>(streams from BDP)"]
-  end
-  PQ --> CAP --> BW --> L2
-  MISS --> RETRY --> OOO --> ADAPT
-  ADAPT -->|leases| WP["Worker pool"]
-```
-
-- **Level 1 — upload scheduling:** priority queue with **weighted fair queuing** so a huge upload cannot starve small ones; **aging** bumps long-waiting items to prevent starvation. Honors global concurrency cap (≥40 simultaneous uploads required) and a user-set **global bandwidth cap**, distributed fairly across active uploads.
-- **Level 2 — chunk scheduling:** iterates the **missing set** (RLE ranges from the manifest), dispatches out-of-order, **retries only failed chunks** with exponential backoff + jitter, and **adapts parallelism** — the number of concurrent data streams/workers per upload is derived from the live BDP estimate (more in-flight on fat high-latency links; fewer on lossy/thin links to limit re-send waste).
-- **Determinism:** scheduling decisions are pure functions of persisted state + telemetry snapshots, so recovery after a crash reproduces a consistent plan.
-
----
-
-## 10. Worker pool design
-
-```mermaid
-flowchart LR
-  LEASE["Chunk lease queue"] --> W1 & W2 & W3 & Wn
-  subgraph pool["Bounded worker pool (size = adaptive, capped)"]
-    W1["worker"]; W2["worker"]; W3["worker"]; Wn["worker"]
-  end
-  W1 & W2 & W3 & Wn -->|"pread(region) into pooled buffer"| SRC["FileSource"]
-  W1 & W2 & W3 & Wn -->|"Transport.SendChunk (credit-gated)"| TR["Transport"]
-  TR -->|ACK| CB["completion → ChunkRepo + checkpoint"]
-```
-
-- **Bounded pool**, size chosen by the scheduler from BDP and CPU, hard-capped (protects CPU/memory). Handles thousands of active chunks by leasing, not by one goroutine per chunk.
-- **Streaming, buffer-reuse I/O:** each worker `pread`s its region into a **pooled buffer** (`sync.Pool`); buffers are recycled after ACK. No whole-file buffering; memory ≈ `poolSize × bufferSize`.
-- **Zero unnecessary copies:** read → (optional compress) → frame → TLS write reuses the same backing buffer where possible; on the direct path we stream the file region straight into the HTTP body with a limited reader (no intermediate copy). (`sendfile` is unavailable through TLS, so we optimize with pooled buffers and vectored writes instead.)
-- **Credit-gated:** a worker cannot send unless flow-control credit exists → clean backpressure with no busy-waiting.
-- **Graceful drain:** `context.Context` cancellation on pause/cancel/shutdown; workers finish or abandon the current chunk (which reverts `InFlight → Pending`) and exit; no torn state.
-
----
-
-## 11. SQLite schema (desktop engine) + server store
-
-### 11.1 Desktop (`uploaderd`) — SQLite
-
-SQLite in **WAL mode**, single-writer (the daemon), `busy_timeout` set, `synchronous=NORMAL` (WAL) with periodic checkpoints. All engine state persists here; this is the source of truth for crash recovery. Migrations are versioned and forward-only.
-
-```sql
--- users: local account cache (no secrets; secrets live in the OS keychain)
-CREATE TABLE users (
-  id            TEXT PRIMARY KEY,          -- CMS user id
-  email         TEXT NOT NULL,
-  display_name  TEXT,
-  jwt_ref       TEXT,                      -- opaque handle into keychain, NOT the token
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
-);
-
--- sessions: transport sessions (SLKT or direct)
-CREATE TABLE sessions (
-  id            TEXT PRIMARY KEY,
-  user_id       TEXT NOT NULL REFERENCES users(id),
-  transport     TEXT NOT NULL CHECK(transport IN ('slkt','direct')),
-  server_addr   TEXT,
-  state         TEXT NOT NULL,             -- Active/Reconnecting/Expired/Closed
-  opened_at     INTEGER NOT NULL,
-  last_seen_at  INTEGER NOT NULL,
-  expires_at    INTEGER
-);
-
--- uploads: one row per file transfer (the upload-level state machine)
-CREATE TABLE uploads (
-  id            TEXT PRIMARY KEY,          -- UploadID
-  user_id       TEXT NOT NULL REFERENCES users(id),
-  cms_file_id   TEXT,                      -- FileID in the CMS
-  source_path   TEXT NOT NULL,
-  filename      TEXT NOT NULL,
-  size_bytes    INTEGER NOT NULL,
-  status        TEXT NOT NULL,             -- Queued/Preparing/.../Completed/Failed/Canceled
-  priority      INTEGER NOT NULL DEFAULT 0,
-  transport     TEXT,                      -- last used path
-  error         TEXT,
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL,
-  completed_at  INTEGER
-);
-CREATE INDEX idx_uploads_status ON uploads(status);
-
--- upload_manifests: the durable manifest (1:1 with uploads)
-CREATE TABLE upload_manifests (
-  upload_id     TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,
-  sha256        TEXT,                      -- final file hash (nullable until hashed)
-  chunk_size    INTEGER NOT NULL,          -- adaptive; == multipart part size
-  chunk_count   INTEGER NOT NULL,
-  multipart_id  TEXT,                      -- S3 multipart upload id (from server/control)
-  object_key    TEXT,                      -- destination key in Spaces
-  session_id    TEXT REFERENCES sessions(id),
-  bytes_done    INTEGER NOT NULL DEFAULT 0,
-  cur_speed_bps INTEGER NOT NULL DEFAULT 0,
-  avg_speed_bps INTEGER NOT NULL DEFAULT 0,
-  eta_seconds   INTEGER,
-  version       INTEGER NOT NULL DEFAULT 1,
-  updated_at    INTEGER NOT NULL
-);
-
--- chunks: per-part state (the chunk-level state machine). "Missing Chunks" = states in (Pending,InFlight)
-CREATE TABLE chunks (
-  upload_id     TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-  idx           INTEGER NOT NULL,          -- part index (0-based)
-  offset_bytes  INTEGER NOT NULL,
-  length_bytes  INTEGER NOT NULL,
-  sha256        TEXT,                      -- per-chunk strong hash
-  crc32c        INTEGER,                   -- per-chunk fast hash
-  etag          TEXT,                      -- returned by storage on part upload
-  state         TEXT NOT NULL,             -- Pending/InFlight/Acked/Verified/Skipped
-  retry_count   INTEGER NOT NULL DEFAULT 0,
-  updated_at    INTEGER NOT NULL,
-  PRIMARY KEY (upload_id, idx)
-);
-CREATE INDEX idx_chunks_state ON chunks(upload_id, state);
-
--- workers: worker/stream telemetry snapshots (Worker monitoring)
-CREATE TABLE workers (
-  id            TEXT PRIMARY KEY,
-  upload_id     TEXT REFERENCES uploads(id) ON DELETE CASCADE,
-  stream_id     INTEGER,
-  state         TEXT NOT NULL,             -- idle/reading/sending/draining
-  cur_chunk     INTEGER,
-  throughput_bps INTEGER,
-  updated_at    INTEGER NOT NULL
-);
-
--- transfer_statistics: time-series for graphs (Transfer Statistics screen)
-CREATE TABLE transfer_statistics (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  upload_id     TEXT REFERENCES uploads(id) ON DELETE SET NULL,
-  ts            INTEGER NOT NULL,
-  bytes_delta   INTEGER NOT NULL,
-  speed_bps     INTEGER NOT NULL,
-  rtt_ms        INTEGER,
-  inflight      INTEGER,
-  loss_pct      REAL
-);
-CREATE INDEX idx_stats_upload_ts ON transfer_statistics(upload_id, ts);
-
--- settings: key/value app + engine settings
-CREATE TABLE settings (
-  key           TEXT PRIMARY KEY,
-  value         TEXT NOT NULL,
-  updated_at    INTEGER NOT NULL
-);
-
--- queue: ordered scheduling view (priority/aging); uploads reference this
-CREATE TABLE queue (
-  upload_id     TEXT PRIMARY KEY REFERENCES uploads(id) ON DELETE CASCADE,
-  priority      INTEGER NOT NULL DEFAULT 0,
-  enqueued_at   INTEGER NOT NULL,
-  eligible_at   INTEGER NOT NULL DEFAULT 0 -- for backoff scheduling
-);
-CREATE INDEX idx_queue_order ON queue(priority DESC, enqueued_at ASC);
-
--- logs: structured local logs (Logs screen + export)
-CREATE TABLE logs (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts            INTEGER NOT NULL,
-  level         TEXT NOT NULL,
-  component     TEXT NOT NULL,
-  upload_id     TEXT,
-  msg           TEXT NOT NULL,
-  fields_json   TEXT
-);
-CREATE INDEX idx_logs_ts ON logs(ts);
-
--- events: append-only, tamper-evident audit trail (SOC2). Hash-chained.
-CREATE TABLE events (
-  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts            INTEGER NOT NULL,
-  actor         TEXT,                      -- user id / 'system'
-  kind          TEXT NOT NULL,             -- upload.created, chunk.acked, auth.refresh, ...
-  upload_id     TEXT,
-  payload_json  TEXT,
-  prev_hash     TEXT NOT NULL,             -- hash of previous event (chain)
-  hash          TEXT NOT NULL              -- H(prev_hash || canonical(payload))
-);
-```
-
-The manifest fields required by the brief — UploadID, FileID, Filename, Size, SHA256, Chunk Size, Chunk Count, Chunk States, Missing Chunks, Retry Count, Session ID, Current Speed, Average Speed, ETA, Priority, Upload Status — are all covered across `uploads` + `upload_manifests` + `chunks` (Missing Chunks is derived from `chunks.state`, kept cheap via `idx_chunks_state`).
-
-### 11.2 Server store — Postgres (deliberate deviation, see Appendix A)
-
-The brief lists SQLite under "DATABASE", but those tables (`workers`, `queue`, `transfer_statistics`, `settings`) are clearly **client-engine** concepts, and the server is required to be **horizontally scalable with shared storage**. SQLite is single-node and cannot back a multi-instance server. Therefore:
-
-- **Desktop engine → SQLite (embedded).** ✔ matches the brief's table list.
-- **Upload server → Postgres / DO Managed DB (shared).** Small footprint: per-upload `multipart_id`, ownership (`user_id`, `cms_file_id`), part index → ETag/sha, status, timestamps, and a **server-side append-only audit table** shipped to central WORM logging. Any server instance can resume/assemble any upload because state is shared. This is flagged for approval in Appendix A.
-
----
-
-## 12. Server architecture
-
-```mermaid
-flowchart TB
-  LB["Session-aware LB<br/>(L4 for SLKT, L7 for control HTTPS)"]
-  subgraph inst["upload-server instance (stateless compute)"]
-    SLKT["SLKT terminator<br/>(data plane)"]
-    CTRL["Control API (HTTPS)<br/>presign, parts, complete"]
-    ASM["Assembler + verifier"]
-    NOTIF["CMS notifier"]
-    REAP["Stale-upload reaper"]
-    AUTHZ["JWT verify + ownership"]
-  end
-  PG[("Shared store (Postgres)")]
-  OS[("Spaces")]
-  CMS["Video CMS"]
-
-  LB --> SLKT & CTRL
-  SLKT --> AUTHZ --> PG
-  CTRL --> AUTHZ
-  SLKT -->|UploadPart| OS
-  CTRL -->|presign UploadPart| OS
-  ASM -->|CompleteMultipart + HEAD verify| OS
-  ASM --> PG
-  NOTIF --> CMS
-  REAP --> PG & OS
-```
-
-**Responsibilities (all from the brief):** authenticate JWT (verify signature via CMS JWKS, `exp`, `aud`, scope, ownership claim); establish upload sessions; receive chunks (SLKT) and record parts (direct); validate integrity (per-part CRC32C + SHA256, storage checksum); persist upload state (Postgres); recover interrupted sessions (resume from shared state, any instance); assemble completed files (`CompleteMultipartUpload`); verify final checksum (HEAD + sha compare); notify CMS; clean up stale uploads (reaper aborts multipart uploads past TTL, reclaims storage).
-
-**Horizontal scale:** compute instances are stateless; all durable state is in Postgres + Spaces. A session is *pinned* to one instance only while its TCP/SLKT connection is live (L4 affinity by connection); on reconnect the client may land on any instance and resume from shared state. The control (HTTPS) API is fully stateless behind an L7 LB.
-
-**Backpressure at the server:** the SLKT terminator watches its Spaces `UploadPart` latency/queue depth and shrinks client credits (`FLOW_UPDATE`) or sends `BACKPRESSURE` when the storage write path saturates — protecting the instance from memory blowup under 40+ concurrent multi-GB streams.
-
----
-
-## 13. Storage abstraction
-
-A single port; adapters are swappable. DO Spaces first; the interface is S3-shaped but not S3-leaky, so GCS/Azure adapters are additive.
+### `packages/storage` — the `ObjectStore` port
 
 ```go
-// packages/storage
 type ObjectStore interface {
-    InitMultipart(ctx, key string, meta ObjectMeta) (multipartID string, err error)
-    // server-in-path: server streams bytes as a part
-    UploadPart(ctx, key, multipartID string, partIdx int, r io.Reader, sz int64, sha256 []byte) (etag string, err error)
-    // direct failover: hand the client a scoped, short-TTL URL
-    PresignUploadPart(ctx, key, multipartID string, partIdx int, ttl, sizeLimit int64) (url string, err error)
-    CompleteMultipart(ctx, key, multipartID string, parts []Part) (finalETag string, err error)
-    AbortMultipart(ctx, key, multipartID string) error
-    Head(ctx, key string) (ObjectInfo, error)
-    Get(ctx, key string, rng *ByteRange) (io.ReadCloser, error)
-    Delete(ctx, key string) error
-    Capabilities() StoreCaps   // multipart limits, checksum algos, presign support
+    InitMultipart(ctx context.Context, key string) (uploadID string, err error)
+    UploadPart(ctx context.Context, key, uploadID string, partNumber int, r io.Reader, size int64) (Part, error)
+    CompleteMultipart(ctx context.Context, key, uploadID string, parts []Part) error
+    AbortMultipart(ctx context.Context, key, uploadID string) error
+    Get(ctx context.Context, key string) (io.ReadCloser, error)
 }
 ```
+Plus an optional `PartPresigner` capability interface. Two concrete implementations: `MemStore` (in-memory fake, used for dev/tests and as the default backend) and `S3Store` (`s3store.go`, real `minio-go/v7` **Core API** usage — `NewMultipartUpload`, `PutObjectPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `Presign`, `GetObject` — chosen specifically so one protocol chunk maps 1:1 to one multipart part). Every transport adapter in `packages/transport` and `packages/transport/slkt` implements this same interface, confirming the "one interface for every transport" design does hold in code.
 
-**Multipart constraints that flow back into chunk sizing (§5.4):** S3/Spaces require parts ≥ 5 MiB (except the last) and ≤ 10,000 parts per upload. Therefore adaptive chunk size is clamped to `max(5 MiB, ceil(size / 10000))` and an upper bound (e.g. 5 GiB/part). For a 5 TB file that yields ~512 MiB parts — one multipart upload covers TB-scale within limits. Sub-5-MiB files use a single `PUT`. This is why the "chunk = part" identity is not just elegant but *bounded and correct*.
+### `packages/transport` — the multiple upload paths
 
-**Unified assembly:** whichever path uploaded a given part, its ETag + index land in the shared store; `CompleteMultipart` consumes the full part list. The assembler never branches on transport.
+All of these are real, compiled, and reachable — confirmed by both `apps/uploaderd` and `apps/uploader-cli` calling `transport.Choose(...)` (`auto.go`):
 
-**Storage-side integrity:** enable per-part SHA256 checksums (Spaces supports S3 checksum headers) so storage independently validates each part; the server cross-checks against the manifest's per-chunk SHA256 before `Complete`.
+- **`HTTPStore`** (`httpstore.go`) — proxies multipart operations to `apps/upload-server`'s JSON API over HTTP(S).
+- **`NewHTTP3Store`** (`http3.go`) — the same `HTTPStore`, wired to a `quic-go/http3.Transport` for HTTP/3.
+- **`PresignedStore`** (`presigned.go`) — direct-to-storage path: control operations (init/complete/abort) go through `HTTPStore`, but `UploadPart` fetches a presigned URL from the server and `PUT`s bytes straight to object storage, bypassing the server for the data itself.
+- **`slkt.Client`/`slkt.Server`** (`packages/transport/slkt/`) — see below.
+- **`Chooser`/`FailoverStore`** (`breaker.go`, `failoverstore.go`) — a real circuit-breaker (closed/open/half-open, per-candidate consecutive-failure tracking, periodic re-probing) that races/falls back between the above candidates. `auto.go`'s `-transport auto` mode drives all candidates through this chooser.
+
+**`packages/transport/slkt`** — the custom protocol, hybrid UDP (bulk data) + TCP (control/NAK):
+- `Client` implements `ObjectStore` with a NAK/retransmit loop (up to 16 rounds) and a token-bucket pacer that is a **fixed 64 MiB/s placeholder** — its own comment notes BBR-style adaptive pacing is not yet implemented.
+- `Server` reassembles parts via a per-packet bitset, verifies CRC32C, and reports selective NAKs.
+- **Buffers full parts in memory** on both sides (`buf: make([]byte, size)`) — there is no disk-backed reassembly, so very large parts are memory-bounded in practice, contrary to the "TB-scale, bounded memory" claim in the original design.
+- Trusts whatever multipart ID it is given; enforces no ownership check of its own (ownership is only checked by `apps/upload-server`'s HTTP control plane).
+
+### `packages/protocol` — the wire frame codec
+
+`frame.go` implements a genuine 26-byte big-endian frame header (Magic + Version + Type + Flags + StreamID + Sequence + PayloadLen + HeaderCRC32C), with `Encode`/`ReadFrame`, magic/CRC validation, and an 8 MiB payload cap. It defines ~20 frame type constants (`TypeHello`, `TypeAuth`, `TypeSessionOpen`, `TypeFlowUpdate`, `TypeDedupQuery`, etc.).
+
+*(Gap)* Of these ~20 types, `packages/transport/slkt` only ever constructs one — `TypeChunkData`. All session/auth/flow-control/dedup/completion semantics are instead carried by a separate, ad hoc JSON control-message struct sent length-prefixed over TCP (`slkt/wire.go`), which does not use the `protocol.Type*` constants at all. The frame codec is real and tested, but most of the frame types it defines are currently unused/dead.
+
+### `packages/auth` — token verification
+
+`Verifier` interface: `Verify(ctx, token) (subject string, err error)`. Two implementations: `DevVerifier` (constant-time compare against one static token, dev/test only) and `JWTVerifier` (`jwt.go`) — a hand-rolled, stdlib-only HS256 verifier: 3-segment split, HMAC-SHA256 signature check, `alg == "HS256"` enforcement, `exp`/`nbf` checks, optional `iss`/`aud` checks, requires non-empty `sub`.
+
+*(Gap)* No JWKS-based RS256 verification exists. Both the package's own doc comment and `jwt.go` state this is intentionally deferred — the production verifier for CMS-issued JWTs is future work, to plug in behind the same `Verifier` interface.
+
+### `packages/ipc` — desktop/CLI ↔ daemon protocol
+
+Plain **HTTP+JSON over a Unix domain socket**, with **Server-Sent Events** for the live stream — explicitly stated in the package's own doc comment. This is **not gRPC**, contradicting the original design's stated choice.
+
+Routes (`server.go`): `POST /v1/uploads` (enqueue), `GET /v1/uploads` (list), `GET /v1/uploads/{id}` (get), `POST /v1/uploads/{id}/pause|resume|cancel`, `GET /v1/events` (SSE stream), `GET /v1/metrics`. Every request (including the SSE stream) requires a constant-time-compared bearer token. The token is generated once and stored **as a plain file** at `0600` under the daemon's state directory — **not** in the OS keychain/DPAPI/Secret Service as the original design specified *(Gap)*.
+
+### `packages/bench` — not shipped
+
+A test-only UDP-relay link emulator (configurable loss/latency) plus a comparative benchmark (`TestTransportComparison`) pitting `slkt` against HTTP/3 through the relay. Its own doc comment states nothing in the shipping binaries imports it.
+
+### `apps/uploader-desktop` — the GUI
+
+Wails v3 app, its own nested Go module. `main.go` binds exactly one Wails service, `UploadService` (`service.go`), which holds only an `*ipc.Client` — no upload state lives in the GUI process. Its six methods (`List`, `Enqueue`, `Pause`, `Resume`, `Cancel`, `Metrics`) are the entire Go→JS API surface, confirmed by the generated bindings.
+
+Frontend (`frontend/src/`): `App.tsx` is the single stateful component — polls `List()`/`Metrics()` every 1.5s and also subscribes to an `upload.event` push (which only triggers a re-list, never applied as an incremental delta), with a plain `useState`/`useMemo` model (no Redux/Zustand/routing library). `layout.tsx` provides `Sidebar`/`TopBar`; `views.tsx` implements five screens (`QueueView`, `IngestView`, `LibraryView`, `ActivityView`, `SettingsView`); `ui.tsx` holds shared presentational components; `icons.tsx` is inline SVG; `format.ts` holds local types mirroring `packages/ipc`'s wire shapes plus formatting helpers.
+
+A more detailed, independently evidence-verified doc for this app exists at `apps/uploader-desktop/architecture.md` (untracked, dated 2026-09-08) and is a good source for anyone extending the desktop app specifically; it additionally notes: no user-facing error surface for failed pause/resume/cancel (only `console.error`), a duplicated/drifting terminal-status list between `tray.go` and `format.ts`, and no CMS login/auth flow found anywhere in this app.
+
+### `apps/upload-server` — server-side terminator(s)
+
+`Server.Handler()` (`apps/upload-server/server.go`) registers, behind bearer-token auth (except the health probe):
+- `POST /v1/multipart` (init)
+- `PUT /v1/multipart/{id}/parts/{n}` (upload part)
+- `POST /v1/multipart/{id}/complete`
+- `DELETE /v1/multipart/{id}` (abort)
+- `GET /v1/object` (fetch)
+- `POST /v1/multipart/{id}/parts/{n}/presign` (only registered when the storage backend implements `PartPresigner`, i.e. the S3 backend)
+- `GET /v1/ping` (unauthenticated reachability probe)
+
+Ownership of each multipart ID is tracked **in-memory** (`OwnerStore`/`memOwners`) — the file's own doc comment states this is "deliberately minimal for v1" and that production would move it to a shared store (e.g. Postgres); that shared store does not exist in code *(Gap)*. There is exactly one server process type per binary — no separate control-plane/data-plane process split; the two roles are logically separated within one process by the port-sharing/demux scheme in `apps/upload-server/cmd/upload-server/mux.go`.
+
+### `apps/uploader-cli` — legacy single-process harness
+
+Runs the engine in-process with no `packages/ipc` involvement at all; its own doc comment describes it as "the headless controller for the engine until the Wails desktop UI is built." It now coexists with, rather than being superseded by, the daemon/desktop split *(Observed architectural inconsistency — flagged in Gaps)*.
 
 ---
 
-## 14. Security model (with SOC2 mapping)
+## System, Request, and Data Flows
 
-### 14.1 Controls
+### Enqueue → upload → verify (via the daemon, any transport)
 
-- **Transport encryption:** TLS 1.3 on every hop (client↔server SLKT, client↔Spaces direct, server↔Spaces, server↔CMS). Optional mTLS for server-fleet internal traffic.
-- **AuthN:** CMS-issued JWT. The server verifies signature via the CMS **JWKS**, plus `exp`, `nbf`, `aud`, and an `upload` scope. We **do not modify CMS auth APIs**; we consume them. The daemon refreshes tokens ahead of expiry and stores them only in the OS keychain.
-- **AuthZ / ownership:** every chunk, part-record, complete, and presign request is checked against the JWT subject's ownership of `uploadId`/`cms_file_id`. Presigned URLs are scoped to **one object key + one part**, short TTL, with a content-length limit to prevent misuse.
-- **Credential storage:** JWTs and Spaces-scoped credentials live in **macOS Keychain / Windows DPAPI (Credential Manager) / Linux Secret Service**. Never plaintext on disk. The SQLite DB stores only opaque handles; optional SQLCipher at-rest encryption for the whole DB (confidentiality).
-- **Replay protection:** per-session monotonic `FRAME SEQUENCE` + client/server nonces from the AUTH exchange; idempotent, key-scoped part writes make any replayed CHUNK_DATA a no-op.
-- **Integrity / tamper detection:** per-chunk CRC32C (fast) + SHA256 (strong) on the wire; storage-side per-part checksums; **final whole-file SHA256 verified after assembly** before the upload is `Completed` or the CMS is notified. Any mismatch → reject + `ERROR` + audit event; never mark complete.
-- **Version negotiation:** HELLO enforces a mutually supported protocol version; downgrade attacks are rejected because the negotiated version is bound into the authenticated session.
-- **Session expiration:** idle + absolute TTLs; expired sessions require re-auth then resume.
-- **Least-privilege storage IAM:** the server uses scoped Spaces keys (per-bucket, no account root); direct-path clients never hold long-lived storage credentials — only short-TTL presigned URLs.
-- **Supply chain:** `go.mod` pinned + checksummed, `govulncheck` + `gosec` in CI, SBOM generated per release, **desktop binaries code-signed & notarized** (macOS notarization, Windows Authenticode) and updates delivered over signed channels.
+1. **Desktop UI** calls `UploadService.Enqueue(path)` → **`ipc.Client`** → `POST /v1/uploads` on the daemon's Unix socket.
+2. **`uploaderd`**'s `ipc` backend calls **`Engine.Enqueue`**: streams the file once to compute its whole-file SHA-256, plans chunk size/count against S3 multipart limits, persists an `uploads`+`upload_manifests`+`chunks`+`queue` row set in one transaction, appends a hash-chained `events` row, emits `upload.created` on the `EventBus`.
+3. **`Supervisor.Kick`** picks the upload up (via `RunnableUploads`) and calls **`Engine.Run`**, which resets any stale `InFlight` chunks, initializes the multipart upload (through whichever `ObjectStore` the active `transport.Chooser` currently favors), and computes the missing-chunk set.
+4. One `scheduler.Task` per missing chunk runs through `scheduler.Run` (bounded concurrency): each reads its byte range via `io.SectionReader`, tees through SHA-256, calls `ObjectStore.UploadPart`, marks the chunk `Acked`, updates progress/telemetry, emits a `progress` event.
+5. When all chunks are acked, **`Engine.finish`** calls `CompleteMultipart`, then re-reads the assembled object and **verifies the whole-file SHA-256** before marking the upload `Completed`. A mismatch leaves it in a non-`Completed` state rather than silently finishing.
+6. `Notifier.AssetReady` (an HMAC-signed webhook with an idempotency key, or a log line in dev) tells the CMS the asset is ready.
+7. The desktop UI never sees any of this directly — it polls `List()`/`Metrics()` on an interval and also re-lists on receiving an SSE `upload.event`.
 
-### 14.2 SOC2 Trust Services Criteria mapping
+### Transport selection and failover
 
-| TSC | How this design satisfies it |
+`transport.Choose` builds whichever concrete `ObjectStore` the `-transport` flag names (`h3`, `slkt`, `http`, `presigned`), or in `auto` mode builds all of them behind a `Chooser`/`FailoverStore` that tracks per-candidate health (closed/open/half-open circuit-breaker state) and re-probes periodically. Because every candidate implements the same `ObjectStore` interface, `Engine` never branches on which transport is active — the same `InitMultipart`/`UploadPart`/`CompleteMultipart` calls work regardless of path *(Verified — this is the one core design idea from the original draft that holds fully in code)*.
+
+### Crash recovery
+
+On daemon (or CLI `-serve`) startup, `resumable.Recover` resets every chunk still `InFlight` back to `Pending` and its upload back to `Ready`; `Engine.Run` performs the same reset again per-upload when it is invoked. Because chunk state is persisted to SQLite (WAL mode) after every transition, no upload restarts from zero after a crash — only in-flight chunks (not yet acked) are re-sent.
+
+---
+
+## External Integrations
+
+- **Object storage (DigitalOcean Spaces / any S3-compatible store)** — via `packages/storage.S3Store`, using `minio-go/v7`'s Core API for multipart operations, and via presigned URLs for the direct-upload transport path. Failure behavior: errors from `minio-go` calls propagate up through `Engine`, which leaves the affected chunk `Pending` for retry rather than the upload `Completed`.
+- **Video CMS** — via `packages/uploader.HTTPNotifier`, an HMAC-signed webhook POST with an `Idempotency-Key` header, sent once a file is assembled and verified. *(Unclear)* No CMS login/authentication flow was found in `apps/uploader-desktop`, and no JWKS integration exists yet in `packages/auth` — how the daemon/desktop currently obtain and refresh a CMS-issued token is not verifiable from this repo alone.
+
+---
+
+## Data and Storage
+
+**SQLite** (`packages/database`, `modernc.org/sqlite`, pure Go, WAL mode, single-writer, `packages/database/migrations/0001_init.sql`) is the only datastore for engine state, on the daemon side:
+
+| Table | Purpose |
 |---|---|
-| **Security (Common Criteria)** | TLS 1.3 everywhere; JWT authN + ownership authZ; least-privilege IAM; keychain-backed secrets; replay + downgrade defenses; dependency scanning, SBOM, signed binaries; local RPC over UDS + per-user token (no network exposure of the engine). |
-| **Availability** | Separate supervised daemon (auto-restart); full resume/crash recovery (§15); horizontally scalable stateless servers; server-store backups + DR; health checks & alerting. No upload restarts from zero. |
-| **Processing Integrity** | End-to-end checksums (CRC32C + SHA256 + storage checksum + final HEAD verify); idempotent, index-keyed writes; deterministic assembly; `Completed` is gated on verified integrity; reconciliation of part sets. |
-| **Confidentiality** | Encryption in transit and (optionally) at rest; data classification of media + identity; scoped short-TTL credentials; retention & deletion policy; secrets never logged (redaction in `logger`). |
-| **Privacy** (if in scope) | Minimal PII (CMS identity only); no content inspection beyond hashing; data-subject deletion honored by aborting/removing uploads and purging local state. |
+| `users` | local account cache (no secrets) |
+| `sessions` | transport session bookkeeping |
+| `uploads` | one row per file transfer — the upload-level status |
+| `upload_manifests` | manifest fields: sha256, chunk size/count, multipart id, object key, speed/ETA |
+| `chunks` | per-part state: offset, length, sha256/crc32c, etag, state, retry count |
+| `workers` | worker/stream telemetry snapshots |
+| `transfer_statistics` | time-series samples for graphs/diagnostics |
+| `settings` | key/value app+engine settings |
+| `queue` | priority/enqueued-at ordering (only `priority` is actually read; `eligible_at` backoff scheduling is written but never consumed) |
+| `logs` | structured local logs |
+| `events` | append-only, hash-chained audit trail (`prev_hash`/`hash` via SHA-256) |
 
-**Cross-cutting audit:** the `events` table is **append-only and hash-chained** (`hash = H(prev_hash ‖ canonical(event))`) on the client; the server ships an equivalent audit stream to **central, tamper-evident (WORM) logging**. All timestamps use NTP-synced clocks so the audit trail is temporally trustworthy. Change management (CI/CD with reviews, signed releases, migration versioning) and incident-response hooks (alertable error events) complete the compliance story.
+This schema is close to a verbatim match of the original design (§11.1 of the prior draft) — the one section of that draft that was carried into code essentially unchanged.
 
----
+**Server-side state** — `apps/upload-server`'s multipart-ID-to-owner mapping is in-memory only (`OwnerStore`), not the shared Postgres store the original design called for; a server restart loses this ownership map (though the underlying storage-side multipart upload itself survives, since it lives in object storage, not in the server process) *(Gap)*.
 
-## 15. Failure recovery strategy
-
-Guiding invariant: **nothing critical is memory-only; every state change is persisted before it is acted upon as done; and no upload ever restarts from zero unless the user deletes it.**
-
-| Failure | Detection | Recovery |
-|---|---|---|
-| **UI window closes / minimized** | n/a | Daemon unaffected; transfers continue; tray shows progress. |
-| **UI crashes** | RPC disconnect | Daemon keeps transferring; UI relaunch reconnects and re-reads state from SQLite. |
-| **Daemon crashes** | service manager | Auto-restart; on boot the engine loads SQLite, resets any `InFlight` chunks → `Pending`, resumes only missing parts. |
-| **Power loss** | on restart | WAL durability + manifest checkpoints; partially-written chunk is discarded and re-sent; DB commits are atomic → no torn manifest. |
-| **OS restart** | LaunchAgent/systemd/Service | Daemon auto-starts at login/boot and resumes. |
-| **Network drop** | PING timeout / write error | Enter `Reconnecting`; exponential backoff + jitter; `SESSION_RESUME` returns the missing-set; continue. |
-| **Custom transport blocked mid-run** | resets/timeouts/DPI | Failover to **direct-to-storage** using the same manifest + multipart id; no restart. |
-| **Server instance crash** | connection loss | Reconnect via LB to any instance; shared Postgres holds multipart id + part ETags → resume. |
-| **Spaces transient error** | 5xx/timeout | Retry with backoff+jitter; parts are idempotent by index. |
-| **JWT expired / revoked** | 401 / verify fail | Silent refresh; if revoked, pause + surface re-login (transfer state preserved). |
-| **Disk full (source unreadable / temp)** | I/O error | Pause upload, alert user, resume when resolved. |
-| **Checksum mismatch** | verify stage | Mark affected chunk(s) `Pending`, re-send; if final mismatch persists → `Failed` (never `Completed`). |
-
-**Checkpoint cadence:** chunk ACK → persist immediately (cheap, indexed). Manifest speed/ETA aggregates → throttled writes (e.g. every N chunks or T seconds) to avoid write amplification, but *completion facts* (ETag, state) are always durable before being trusted.
+**Object storage** — final assets and in-progress multipart parts live in the configured `ObjectStore` (Spaces/S3/MinIO in production, an in-memory `MemStore` in dev/tests).
 
 ---
 
-## 16. Performance optimization strategy
+## Security
 
-Targets: multi-GB and TB-scale files, long-distance WAN, high BDP, packet loss, intermittent links — maximizing link utilization while remaining fair.
+- **Transport encryption:** TLS on the HTTP(S) control plane (self-signed dev cert or a supplied cert/key); SLKT's own control channel is a distinct, non-TLS JSON-over-TCP channel (see [Gaps](#architecture-gaps-and-unclear-areas)).
+- **AuthN (server):** `packages/auth.Verifier` — either a static dev token (`DevVerifier`) or a hand-rolled HS256 JWT check (`JWTVerifier`), enforced on every `apps/upload-server` route except `/v1/ping`.
+- **AuthN (local IPC):** every `packages/ipc` request, including the SSE stream, requires a constant-time-compared bearer token generated once and stored as a `0600` plain file under the daemon's state directory.
+- **AuthZ / ownership:** `apps/upload-server` tracks per-multipart-ID ownership in memory (`OwnerStore`) and checks it on part/complete/abort requests.
+- **Integrity:** per-chunk SHA-256 computed on the fly during upload; whole-file SHA-256 re-verified after `CompleteMultipart` before an upload is ever marked `Completed`.
+- **Audit trail:** `packages/manifests.Store.AppendEvent` writes a genuine hash-chained (`SHA256(prev_hash ‖ payload)`) `events` log.
 
-- **Bounded, streaming memory:** `memory ≈ workerCount × bufferSize`, independent of file size. Buffers from `sync.Pool`; no whole-file or whole-chunk-set buffering. A 5 TB upload uses the same RAM as a 5 GB one.
-- **Zero unnecessary copies:** read region → (optional compress) → frame → TLS write reuses one backing buffer; direct path streams the file region straight into the HTTPS body via a limited reader.
-- **Parallelism tuned to BDP:** on TCP v1, a **connection pool** + multiple data streams overcome single-flow CC ceilings on fat, lossy, high-latency links. Stream/worker count is derived live from `bandwidth × RTT`.
-- **App-level congestion control (BBR-inspired):** continuously estimate delivery rate (EWMA) and min-RTT; set pacing rate and in-flight cap to the estimated bottleneck bandwidth; back off on RTT inflation (bufferbloat) to stay fair. Over QUIC, native CC takes over.
-- **Adaptive chunk sizing:** bigger parts on stable fat links (fewer round trips, fewer ACKs); smaller on lossy links (cheaper re-sends), clamped to multipart limits (§13).
-- **Continuous bandwidth measurement** feeds three knobs at once: parallelism, chunk size, and pacing. Sampled into `transfer_statistics` for the Stats/graphs UI and for diagnostics.
-- **Aggressive transient recovery:** failed-only re-send, out-of-order acceptance, idempotent writes → a blip costs one chunk, never the file.
-- **OS/socket tuning:** enable send/recv buffer autotuning (large `SO_SNDBUF`/`SO_RCVBUF`), `TCP_NODELAY` on control, larger initial windows where the OS allows; document per-OS knobs in the ops runbook.
-- **Compression (optional, smart-default off for media):** most media is already compressed; a quick entropy sample decides. On for text/log sidecars; the `COMPRESSED` frame flag makes it per-chunk.
-- **Deduplication (optional):** whole-file SHA256 pre-check (`DEDUP_QUERY`) can make an already-stored file complete **instantly**; per-chunk dedup skips parts already present server-side (`DEDUP_HIT`), valuable for re-uploads and versioned media.
-- **Low CPU:** CRC32C uses the hardware CRC instruction; SHA256 uses the SHA extensions where present; hashing overlaps I/O in the streaming pipeline.
+**Not implemented** *(Gap, all explicitly noted in the code's own comments)*: JWKS/RS256 verification for CMS-issued tokens; OS-keychain/DPAPI/Secret-Service storage for the local IPC token (currently a plain file); a shared/persistent ownership store on the server (currently in-memory, single-instance only).
 
 ---
 
-## 17. Testing strategy
+## Background and Asynchronous Processing
 
-Hexagonal boundaries make everything unit-testable with mocked ports; a virtual `Clock` makes time-dependent logic deterministic.
-
-- **Unit:** state machines (table-driven transition tests), scheduler fairness/aging, missing-set/RLE math, manifest & chunk repos, frame codec.
-- **Property-based:** chunk reordering, resume from *any* interruption point, and **idempotency** (re-deliver any chunk any number of times → identical final state).
-- **Protocol conformance & fuzzing:** golden wire vectors for every frame type; native Go fuzzing on the frame parser (malformed lengths, truncation, bad CRC, oversized payloads) — the parser must never panic or over-allocate.
-- **Integration:** real SQLite + **MinIO** (S3-compatible) standing in for Spaces + in-process server; full enqueue→complete→verify.
-- **Network fault injection:** `toxiproxy` / `netem` for latency, jitter, loss, partition, and bandwidth caps; assert throughput adaptivity and correctness under 200 ms RTT + 2% loss (high-BDP + lossy).
-- **Crash/chaos matrix:** `kill -9` the daemon and the server at every stage (preparing, mid-transfer, mid-assemble); pull the network; simulate power loss (drop unflushed writes). Each row of the §15 table is a test asserting *no zero-restart, no corruption, verified completion*.
-- **Scale/soak:** 500 GB+ synthetic files, 40+ concurrent uploads, thousands of active chunks; `pprof` CPU/heap/goroutine profiles; leak detection over multi-hour soak.
-- **Security:** authZ tests (ownership, expired/revoked JWT, replayed frames, downgrade attempts), TLS config assertions, presign-scope tests, `govulncheck`/`gosec`, fuzz.
-- **E2E:** desktop → server → MinIO → mock CMS webhook, including the **firewall-failover** case (block the SLKT port and assert automatic direct-path completion).
-- **CI gates:** unit+integration on every PR; fuzz + fault-injection nightly; scale/soak on a schedule; coverage floor on the domain core.
+- **`Supervisor`** (daemon) — long-lived, tracks running uploads by cancel-func, backfills free concurrency slots from the queue on completion of each upload, and exposes `Pause`/`Resume`/`Cancel`/`Stop`.
+- **`Manager`** (CLI `-serve` mode) — a one-shot queue drainer, a separate implementation with different pause semantics from `Supervisor` (see [Components](#components-and-responsibilities)).
+- **`scheduler.Run`** — the actual concurrency primitive underneath both: an `errgroup` with `SetLimit`, used both for "chunks within one upload" and "uploads within one drain pass." No fairness, priority weighting, or backoff-with-jitter exists at this layer; retry-on-failure is handled instead by `manifests.Store.MarkPending` being called again from `Engine`.
+- **Bandwidth/ETA sampling** — `packages/telemetry.Sampler`, a pure EWMA implementation fed per-chunk by `Engine`, exposed to the UI via `Metrics()`/`transfer_statistics`.
 
 ---
 
-## 18. Incremental implementation roadmap
+## Configuration
 
-Build the **simpler, always-works path first**, then layer the custom protocol as a throughput optimization on top of shared machinery. Every phase ships something verifiable.
+- **Daemon (`uploaderd`):** SQLite DB path, Unix socket path (`packages/ipc.DefaultSocketPath`), `-transport` selection (`auto|h3|slkt|http|presigned`).
+- **Server (`upload-server` / `upload-server-h3`):** `-addr` (default `:443`), `-backend mem|s3` (storage backend), `-jwt-secret` (enables `JWTVerifier`; otherwise falls back to a dev token), `-tls-cert`/`-tls-key` (otherwise a self-signed dev cert is generated).
+- **Desktop app:** a macOS LaunchAgent plist controls whether/how the daemon is kept alive independent of the GUI; `SLIKE_SERVER` in that plist currently ships commented out, defaulting the app to `localhost:443` per `apps/uploader-desktop/architecture.md`.
 
-```mermaid
-flowchart LR
-  P0["P0 Foundations"] --> P1["P1 Direct-to-storage MVP"] --> P2["P2 Desktop shell + daemon"] --> P3["P3 SLKT primary (TCP/TLS)"] --> P4["P4 Adaptive engine"] --> P5["P5 Reliability hardening"] --> P6["P6 Security/SOC2"] --> P7["P7 Scale-out + QUIC"] --> P8["P8 GA"]
-```
-
-- **P0 — Foundations.** Monorepo + CI/CD; `packages/` skeletons with **ports defined first**; `common`, `logger`, `telemetry`; `database` migrations; MinIO dev harness. *Exit:* interfaces compile, DI composition root wired, empty adapters pass contract tests.
-- **P1 — Direct-to-storage MVP (the failover path, built first).** Thin control API mints presigned S3 multipart URLs; client hashes, chunks, uploads parts directly, persists in SQLite, resumes, assembles via `CompleteMultipart`, notifies mock CMS. *Exit:* a 100 GB file uploads, survives a `kill -9` mid-run, and resumes to a verified checksum — **without any custom protocol.**
-- **P2 — Desktop shell + daemon.** Wails v3 app + `uploaderd` separate process + local gRPC/UDS + per-user token + tray + auto-start; reuse CMS React; real login/JWT + refresh; Queue/History/Settings views over engine state. *Exit:* close the window, upload keeps going; relaunch reattaches.
-- **P3 — SLKT primary (TCP/TLS, server-in-path).** `protocol` frames + codec + version/capability negotiation; `transport` SLKT adapter (connection pool, mux, credit flow control, ACKs, resume); server SLKT terminator writing parts to Spaces; **path chooser** with Happy-Eyeballs probe and automatic **failover to P1's direct path.** *Exit:* uploads run over SLKT by default and transparently fall back when the port is blocked.
-- **P4 — Adaptive engine.** Live bandwidth/RTT measurement; adaptive chunk size; adaptive parallelism; BBR-inspired pacing; scheduler WFQ + aging; worker-pool tuning; stats graphs + diagnostics screen. *Exit:* measured link utilization ≥ target on emulated high-BDP + loss.
-- **P5 — Reliability hardening.** Implement and test the full §15 matrix; chaos + fault injection in CI; TB-scale soak; deterministic recovery verified. *Exit:* every failure row green; no zero-restart.
-- **P6 — Security / SOC2.** Keychain integration; hash-chained audit + central WORM shipping; ownership + replay + downgrade defenses; code signing/notarization; SBOM + `govulncheck`/`gosec` gates; observability dashboards; log-redaction audit. *Exit:* controls mapped to TSC and evidenced.
-- **P7 — Scale-out + QUIC.** Server on shared Postgres, multi-instance behind session-aware LB, stale reaper, optional compression/dedup; **QUIC transport adapter** added behind the existing `Transport` port to prove the abstraction (engine untouched). *Exit:* two servers share one upload's resume; QUIC path passes the same conformance suite.
-- **P8 — GA.** Signed installers, signed auto-update, docs, ops runbooks, on-call alerts. *Exit:* thousands-of-users readiness review passed.
+No secret values are reproduced here; none were found hardcoded in the repository during this review.
 
 ---
 
-## Appendix A — Deliberate deviations from the brief (for approval)
+## Build, Runtime, and Deployment
 
-1. **Server DB is Postgres, not SQLite.** SQLite is single-node and cannot back the required horizontally-scalable, shared-storage server. SQLite remains the **desktop engine** store (matching the brief's table list, which is client-shaped). *Requesting approval.*
-2. **Engine is a separate process (`uploaderd`), not an in-app goroutine.** This is the only robust way to satisfy "survives UI crash / window close / logout." The brief says "background service"; we implement it as a true supervised OS service.
-3. **Chunk ≡ S3 multipart part.** Unifies both data paths under one assembly mechanism and bounds adaptive chunk sizing (5 MiB ≤ part ≤ 5 GiB, ≤ 10k parts). Alternative (server concatenates independent chunk objects) is possible but adds a second assembly mechanism; we recommend the unified model.
-4. **Hybrid = protocol-primary + direct-failover** (per your decision), motivated by enterprise firewall/DPI reachability, not just RTT tiering.
+- **Module layout:** one root Go module (`code.sli.ke/go/vega`) plus one nested module for the desktop app (`apps/uploader-desktop`, using a `replace` directive back to the monorepo root).
+- **CI:** no `.github`, GitLab CI, CircleCI, or Azure Pipelines configuration exists anywhere in the repository *(Gap)*.
+- **Containers:** `apps/uploader-desktop/build/docker/Dockerfile.server` and `Dockerfile.cross` build the **desktop app in "server mode"** (static Go binary + bundled frontend assets, `EXPOSE 8080`) — these are not related to `apps/upload-server`. **No Dockerfile or deploy config exists for `apps/upload-server`/`upload-server-h3` at all** *(Gap)*.
+- **Desktop packaging:** Taskfile-driven builds under `apps/uploader-desktop/build/{darwin,windows,linux,android,ios}` for native installers (Wails tooling), plus icon/branding assets — some of which (`build/config.yml`) still carry Wails-scaffold placeholder branding per `apps/uploader-desktop/architecture.md`.
+- **Prebuilt binaries** `uploaderd` and `upload-server-h3` exist at the repo root as build artifacts (not committed source, likely local build output — `.gitignore` should be checked before assuming these belong in version control).
 
-## Appendix B — Open questions for review
+---
 
-1. **CMS JWKS / token claims:** does the CMS expose a JWKS endpoint and an `aud`/scope suitable for the upload server to verify, or do we need a token-exchange step? (No CMS auth-API changes intended either way.)
-2. **CMS notification contract:** webhook vs. polled callback for "asset ready"; expected payload and idempotency key.
-3. **Spaces layout & lifecycle:** bucket/region strategy, key namespace for in-progress parts vs. final assets, and retention for aborted multipart uploads.
-4. **SOC2 scope:** confirm which TSC are in scope (Privacy?) and the central logging/WORM target for audit shipping.
-5. **Custom SLKT port:** default port for the primary path + whether we also offer SLKT-over-443 (ALPN) before falling back to HTTPS-direct.
-6. **Max concurrency & bandwidth defaults** per user tier.
+## Design Decisions and Constraints
 
-## Appendix C — Glossary
+- **Chunk ≡ S3 multipart part**, clamped to `5 MiB ≤ part ≤ 5 GiB`, `≤ 10,000 parts` — implemented exactly as originally designed in `packages/manifests/plan.go`, and it is what lets every transport share one `ObjectStore` interface and one assembly path.
+- **Two real OS processes** for the desktop product (daemon + GUI), communicating over a Unix domain socket with a per-user file token — the survives-UI-crash/close requirement from the original brief is genuinely met, just over HTTP+JSON+SSE rather than the gRPC originally specified.
+- **Multiple interchangeable transports behind one interface**, selected by a circuit-breaker/failover chooser — implemented and wired into both real entry points (`uploaderd`, `uploader-cli`), not aspirational.
+- **Verified-completion invariant** (whole-file SHA-256 check gates the `Completed` state) is enforced in `Engine.finish`, matching the original design's non-negotiable stated in its draft.
+- **Two independent queue-driving implementations** (`Manager` for the CLI, `Supervisor` for the daemon) with subtly different pause semantics exist side by side rather than one shared driver — an implementation choice, not obviously an oversight, but worth resolving deliberately if `apps/uploader-cli` is meant to be retired.
 
-**SLKT** — the custom Slike Transport protocol. **Part/Chunk** — one S3 multipart part; the unit of transfer, retry, and resume. **Missing set** — RLE-encoded set of not-yet-`Acked` parts. **Server-in-path** — bytes traverse the upload server. **Direct path** — client uploads straight to Spaces (failover). **BDP** — bandwidth-delay product. **WFQ** — weighted fair queuing. **uploaderd** — the headless engine daemon.
-```
+---
+
+## Architecture Gaps and Unclear Areas
+
+| Area | Observed state | Gap or uncertainty | Impact |
+|---|---|---|---|
+| Local IPC transport | `packages/ipc` is HTTP+JSON+SSE over a Unix socket | Original design specified gRPC | Cosmetic vs. the old doc, but anyone building a new client should target the real HTTP+JSON API, not gRPC |
+| SLKT frame protocol | `packages/protocol` defines ~20 frame types; `slkt` only ever sends `TypeChunkData` | Session/auth/flow-control/dedup semantics live in an ad hoc JSON control message instead of frame types | The documented wire format is largely dead code; anyone implementing an interoperable SLKT client must read `slkt/wire.go`'s JSON `ctrlMsg`, not `protocol/frame.go`'s type table |
+| SLKT congestion control | Fixed 64 MiB/s token-bucket pacer, explicitly a placeholder in code | No BBR-style adaptive pacing | Throughput on lossy/high-BDP links won't adapt as the original design intended |
+| SLKT part reassembly | Full part buffered in memory on both client and server | No disk-backed reassembly | Very large parts (multi-GB) are memory-bounded per in-flight part, contrary to the "TB-scale, bounded memory" design goal |
+| Scheduler | `packages/scheduler` is a 28-line bounded-concurrency wrapper | No priority/fairness/aging/BDP-adaptive parallelism; `queue.eligible_at` backoff column is dead | Large and small uploads compete for the same fixed worker slots with no fairness guarantee |
+| Auth | Hand-rolled HS256 `JWTVerifier` only | No JWKS/RS256 verification for real CMS-issued tokens; not clear how the desktop app currently obtains a CMS token at all | Production auth integration with the CMS is unverified/incomplete from this repo alone |
+| Local token storage | Per-user IPC token stored as a `0600` plain file | Original design specified OS keychain/DPAPI/Secret Service | Token is protected only by filesystem permissions, not OS credential storage |
+| Server ownership state | `apps/upload-server`'s multipart ownership map is in-memory (`OwnerStore`) | No shared/persistent store (e.g. Postgres) | Server cannot run more than one instance and cannot survive a restart without losing ownership tracking (the underlying storage upload itself is unaffected) |
+| Queue drivers | `Manager` (CLI) and `Supervisor` (daemon) both drive the same `uploads`/`queue` tables independently | Different pause semantics (`ListActive` vs `RunnableUploads`); not clear if this is intentional | Running the CLI's `-serve` mode and the daemon against the same DB concurrently could produce inconsistent queue behavior |
+| `apps/uploader-cli` | Still present, runs the engine in-process with no daemon/IPC | Its own doc comment frames it as a predecessor to the daemon/desktop split, but it hasn't been removed | Two independently-maintained ways to drive the same engine exist in the codebase today |
+| CI / deployment for the server | No CI config anywhere in the repo; no Dockerfile for `apps/upload-server` (only for `apps/uploader-desktop`'s unrelated "server mode") | How the upload-server binaries are actually built, tested, and deployed is not verifiable from this repo | Anyone changing the server should confirm the real deployment process out-of-band before assuming Docker/CI conventions apply |
+| CMS integration | `HTTPNotifier` sends an asset-ready webhook; no CMS login flow found in the desktop app | Unclear how/where the CMS JWT the daemon would need is obtained and refreshed | Any auth-related change should first establish the real current login flow, which is not visible in this repository |
